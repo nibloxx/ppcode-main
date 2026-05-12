@@ -1,0 +1,10 @@
+flask
+flask-cors
+openai
+googlemaps
+pandas
+python-docx
+pdfplumber
+PyMuPDF
+geopy
+requests 
