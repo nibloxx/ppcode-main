@@ -163,8 +163,11 @@ def generate_property_report():
         return jsonify({'error': 'Property generator not initialized'}), 500
     
     try:
-        data = request.get_json()
-        
+        if request.is_json:
+            data = request.get_json()
+        else:
+            data = request.form.to_dict()
+
         if not data or 'address' not in data:
             return jsonify({'error': 'Address is required'}), 400
         
@@ -465,7 +468,7 @@ def generate_combined_report():
             return jsonify({'error': 'Request data is required'}), 400
         
         results = {}
-        
+            
         # Generate property report if address is provided
         if 'address' in data:
             property_data = data.get('property_data', {})
