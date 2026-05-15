@@ -225,6 +225,10 @@ def generate_property_report():
             'error': f'Failed to generate property report: {str(e)}'
         }), 500
 
+@app.route('/generate_report', methods=['POST'])
+def generate_report_alias():
+    return generate_property_report()
+    
 @app.route('/download_property_report/<filename>', methods=['GET'])
 def download_property_report(filename):
     """Download a generated property report"""
