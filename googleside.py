@@ -1,5 +1,6 @@
 import requests
 from datetime import datetime
+from config import get_google_api_key
 
 def get_property_images(address):
     """
@@ -8,7 +9,7 @@ def get_property_images(address):
     Args:
         address: The address to get images for
     """
-    api_key = 'AIzaSyCl6Oc03tJ-MkQEXMc84pF9lXURvPLPmHU'
+    api_key = get_google_api_key()
     
     # Convert address to coordinates
     geocoding_params = {

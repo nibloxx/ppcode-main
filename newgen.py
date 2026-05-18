@@ -560,12 +560,10 @@ def main():
     Example usage
     """
     # Configuration
-    OPENAI_API_KEY = 'sk-rSNepa2p0yahWHyJ27CuZd2snzGme9R2hlNOpreUWDT3BlbkFJLVmbTqYzzOpIt-K5mexrZw5W37ziLI2jkNiz0NmmAA'
-    GOOGLE_API_KEY = 'AIzaSyCl6Oc03tJ-MkQEXMc84pF9lXURvPLPmHU'
+    from config import get_openai_api_key, get_google_api_key
+    OPENAI_API_KEY = get_openai_api_key()
+    GOOGLE_API_KEY = get_google_api_key()
     TEMPLATE_PATH = "template.docx"
-    
-    if not OPENAI_API_KEY or not GOOGLE_API_KEY:
-        raise ValueError("Both OPENAI_API_KEY and GOOGLE_API_KEY environment variables must be set")
     
     # Initialize generator
     generator = ComprehensivePropertyReportGenerator(

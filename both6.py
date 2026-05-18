@@ -1290,9 +1290,9 @@ def main():
     """
     Example usage with market analysis
     """
-    # Configuration with hardcoded API keys
-    OPENAI_API_KEY = 'sk-rSNepa2p0yahWHyJ27CuZd2snzGme9R2hlNOpreUWDT3BlbkFJLVmbTqYzzOpIt-K5mexrZw5W37ziLI2jkNiz0NmmAA'
-    GOOGLE_API_KEY = 'AIzaSyCl6Oc03tJ-MkQEXMc84pF9lXURvPLPmHU'
+    from config import get_openai_api_key, get_google_api_key
+    OPENAI_API_KEY = get_openai_api_key()
+    GOOGLE_API_KEY = get_google_api_key()
     TEMPLATE_PATH = "template4.docx"
     
     # Initialize generator

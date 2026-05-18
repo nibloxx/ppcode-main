@@ -13,6 +13,7 @@ import json
 # Import the classes from both scripts
 from both4 import ComprehensivePropertyReportGenerator
 from comp2 import CompExtractor
+from config import get_openai_api_key, get_google_api_key
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -22,8 +23,6 @@ app = Flask(__name__)
 CORS(app)  # Enable CORS for all routes
 
 # Configuration
-OPENAI_API_KEY = 'sk-rSNepa2p0yahWHyJ27CuZd2snzGme9R2hlNOpreUWDT3BlbkFJLVmbTqYzzOpIt-K5mexrZw5W37ziLI2jkNiz0NmmAA'
-GOOGLE_API_KEY = 'AIzaSyCl6Oc03tJ-MkQEXMc84pF9lXURvPLPmHU'
 TEMPLATE_PATH = "template.docx"
 COMP_TEMPLATE_PATH = "comptemplate.docx"
 
@@ -37,8 +36,8 @@ def initialize_generators():
     
     try:
         property_generator = ComprehensivePropertyReportGenerator(
-            openai_api_key=OPENAI_API_KEY,
-            google_api_key=GOOGLE_API_KEY,
+            openai_api_key=get_openai_api_key(),
+            google_api_key=get_google_api_key(),
             template_path=TEMPLATE_PATH,
             output_dir="property_reports"
         )
@@ -594,5 +593,5 @@ if __name__ == '__main__':
     app.run(
         host='0.0.0.0',  # Allow external connections
         port=5000,
-        debug=True
+        debug=os.environ.get('FLASK_DEBUG', 'false').lower() == 'true',
     ) 
