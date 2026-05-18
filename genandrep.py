@@ -1,13 +1,11 @@
 import openai # type: ignore
 from docx import Document # type: ignore
 from datetime import datetime
-
-
+from config import get_openai_api_key
 
 address = "142 Washington Ave, Garden City, NY 11530"
 
-# Initialize the OpenAI API Key
-client = openai.OpenAI(api_key='sk-rSNepa2p0yahWHyJ27CuZd2snzGme9R2hlNOpreUWDT3BlbkFJLVmbTqYzzOpIt-K5mexrZw5W37ziLI2jkNiz0NmmAA')
+client = openai.OpenAI(api_key=get_openai_api_key())
 
 print('''Calling AI (County, Market, Submarket)...''')
 

@@ -107,9 +107,9 @@ class ComprehensivePropertyReportGenerator:
             template_path: Path to the Word document template
             output_dir: Directory to save generated reports
         """
-        self.openai_client = openai.OpenAI(api_key='sk-rSNepa2p0yahWHyJ27CuZd2snzGme9R2hlNOpreUWDT3BlbkFJLVmbTqYzzOpIt-K5mexrZw5W37ziLI2jkNiz0NmmAA')
+        self.openai_client = openai.OpenAI(api_key=openai_api_key)
         self.gmaps = googlemaps.Client(key=google_api_key)
-        self.google_api_key = 'AIzaSyCl6Oc03tJ-MkQEXMc84pF9lXURvPLPmHU'
+        self.google_api_key = google_api_key
         self.template_path = Path(template_path)
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(exist_ok=True)
@@ -999,8 +999,9 @@ def main():
     Example usage with market analysis
     """
     # Configuration
-    OPENAI_API_KEY = 'your-openai-api-key-here'
-    GOOGLE_API_KEY = 'your-google-api-key-here'
+    from config import get_openai_api_key, get_google_api_key
+    OPENAI_API_KEY = get_openai_api_key()
+    GOOGLE_API_KEY = get_google_api_key()
     TEMPLATE_PATH = "template.docx"
     
     # Initialize generator
