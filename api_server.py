@@ -13,7 +13,7 @@ import json
 # Import the classes from both scripts
 from both4 import ComprehensivePropertyReportGenerator
 from comp2 import CompExtractor
-from config import get_openai_api_key, get_google_api_key
+from config import get_openai_api_key, get_google_api_key, get_esri_api_key
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -23,26 +23,63 @@ app = Flask(__name__)
 CORS(app)  # Enable CORS for all routes
 
 # Configuration
-TEMPLATE_PATH = "template.docx"
+# Prefer the richer BOV template when present; fall back to the legacy template.
+BOV_TEMPLATE_PATH = "bov_template.docx"
+LEGACY_TEMPLATE_PATH = "template.docx"
+TEMPLATE_PATH = BOV_TEMPLATE_PATH if Path(BOV_TEMPLATE_PATH).exists() else LEGACY_TEMPLATE_PATH
 COMP_TEMPLATE_PATH = "comptemplate.docx"
+
+PROSPECT_TEMPLATE_PATH = "bov_prospect_template.docx"
+
+# Map request template names -> file paths
+TEMPLATE_CHOICES = {
+    "bov": BOV_TEMPLATE_PATH,
+    "client": BOV_TEMPLATE_PATH,
+    "prospect": PROSPECT_TEMPLATE_PATH,
+    "legacy": LEGACY_TEMPLATE_PATH,
+}
+
+# Map the frontend documentType values -> template choice keys
+DOCUMENT_TYPE_TEMPLATES = {
+    "bov (client)": "client",
+    "bov (prospect)": "prospect",
+}
+
+
+def resolve_template(data: dict) -> str:
+    """Choose a template file path from request data (template or document_type)."""
+    requested = data.get("template") or data.get("report_template")
+    if not requested:
+        doc_type = (data.get("document_type") or data.get("documentType") or "").strip().lower()
+        requested = DOCUMENT_TYPE_TEMPLATES.get(doc_type)
+
+    if not requested:
+        return TEMPLATE_PATH
+
+    path = TEMPLATE_CHOICES.get(requested.lower(), requested)
+    return path if Path(path).exists() else TEMPLATE_PATH
 
 # Initialize generators
 property_generator = None
 comp_extractor = None
+property_generator_init_error = None
 
 def initialize_generators():
     """Initialize the property generator and comp extractor"""
-    global property_generator, comp_extractor
+    global property_generator, comp_extractor, property_generator_init_error
     
     try:
         property_generator = ComprehensivePropertyReportGenerator(
             openai_api_key=get_openai_api_key(),
-            google_api_key=get_google_api_key(),
             template_path=TEMPLATE_PATH,
+            google_api_key=get_google_api_key(),
+            esri_api_key=get_esri_api_key(),
             output_dir="property_reports"
         )
+        property_generator_init_error = None
         logger.info("Property generator initialized successfully")
     except Exception as e:
+        property_generator_init_error = str(e)
         logger.error(f"Failed to initialize property generator: {e}")
         property_generator = None
     
@@ -81,7 +118,12 @@ def health_check():
         'status': 'healthy',
         'timestamp': datetime.now().isoformat(),
         'property_generator': property_generator is not None,
-        'comp_extractor': comp_extractor is not None
+        'comp_extractor': comp_extractor is not None,
+        'property_generator_error': property_generator_init_error,
+        'location_providers': {
+            'esri': bool(get_esri_api_key()),
+            'google': bool(get_google_api_key()),
+        },
     })
 
 @app.route('/test_upload', methods=['POST'])
@@ -159,7 +201,13 @@ def generate_property_report():
     }
     """
     if not property_generator:
-        return jsonify({'error': 'Property generator not initialized'}), 500
+        initialize_generators()
+    if not property_generator:
+        return jsonify({
+            'error': 'Property generator not initialized',
+            'details': property_generator_init_error or 'Unknown initialization error',
+            'hint': 'Set OPENAI_API_KEY and at least one of ESRI_API_KEY or GOOGLE_API_KEY in .env, then restart api_server.py',
+        }), 500
     
     try:
         if request.is_json:
@@ -173,9 +221,11 @@ def generate_property_report():
         # Extract parameters with defaults
         address = data['address']
         prepared_by = data.get('prepared_by', 'Brayden Fisher')
+        prepared_by_title = data.get('prepared_by_title', '')
         prepared_by_company = data.get('prepared_by_company', 'Colliers International')
         prepared_by_address = data.get('prepared_by_address', '123 North 123 West Orem, UT 12345')
         prepared_for = data.get('prepared_for', 'Austin Shouse')
+        prepared_for_title = data.get('prepared_for_title', '')
         prepared_for_company = data.get('prepared_for_company', 'UCCU Bank')
         prepared_for_address = data.get('prepared_for_address', '789 yellow street Provo, UT 12345')
         property_name = data.get('property_name', 'Property Report')
@@ -186,16 +236,38 @@ def generate_property_report():
         zoning = data.get('zoning', '')
         apn = data.get('apn', '')
         current_owner = data.get('current_owner', '')
+        color_theme = data.get('color', '')
+        lease_or_sale = data.get('lease_or_sale', '')
+        
+        # Extract comparables from uploaded CoStar PDF (optional)
+        comps = []
+        comp_file = request.files.get('comp_pdf_path') if not request.is_json else None
+        if comp_file and comp_file.filename:
+            if not comp_extractor:
+                return jsonify({'error': 'Comp extractor not initialized'}), 500
+            with tempfile.TemporaryDirectory() as temp_dir:
+                pdf_path = Path(temp_dir) / comp_file.filename
+                comp_file.save(str(pdf_path))
+                logger.info(f"Extracting comps from uploaded PDF: {pdf_path}")
+                comps = comp_extractor.extract_comps_from_pdf(str(pdf_path))
+                logger.info(f"Extracted {len(comps)} comps for BOV report")
         
         logger.info(f"Generating property report for: {address}")
+
+        # Select template from document_type / template (BOV Client vs Prospect)
+        template_path = resolve_template(data)
+        property_generator.template_path = Path(template_path)
+        logger.info(f"Using template: {template_path}")
         
         # Generate the report
         document_path = property_generator.process_single_property(
             address=address,
             prepared_by=prepared_by,
+            prepared_by_title=prepared_by_title,
             prepared_by_company=prepared_by_company,
             prepared_by_address=prepared_by_address,
             prepared_for=prepared_for,
+            prepared_for_title=prepared_for_title,
             prepared_for_company=prepared_for_company,
             prepared_for_address=prepared_for_address,
             property_name=property_name,
@@ -205,7 +277,10 @@ def generate_property_report():
             recorded_sale_date=recorded_sale_date,
             zoning=zoning,
             apn=apn,
-            current_owner=current_owner
+            current_owner=current_owner,
+            lease_or_sale=lease_or_sale,
+            color_theme=color_theme,
+            comps=comps,
         )
         
         # Return the download URL and success message

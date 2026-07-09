@@ -1,5 +1,4 @@
 import openai
-import googlemaps
 import pandas as pd
 from docx import Document
 from docx.shared import Inches, Pt, RGBColor
@@ -9,15 +8,12 @@ from datetime import datetime
 import os
 import json
 import requests
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Any
 from dataclasses import dataclass, field
 import logging
 from pathlib import Path
 import re
-from geopy.geocoders import GoogleV3
-from geopy.exc import GeocoderTimedOut
-import time
-from io import BytesIO
+from location_services import HybridLocationService
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -32,11 +28,13 @@ class PropertyReportData:
     
     # Preparer Info
     prepared_by: str = ""
+    prepared_by_title: str = ""
     prepared_by_company: str = ""
     prepared_by_address: str = ""
     
     # Client Info  
     prepared_for: str = ""
+    prepared_for_title: str = ""
     prepared_for_company: str = ""
     prepared_for_address: str = ""
     
@@ -62,6 +60,9 @@ class PropertyReportData:
     apn: str = ""
     current_owner: str = ""
     
+    # Transaction context
+    lease_or_sale: str = ""
+
     # Market Analysis (static)
     marketing_period: str = "Six months or less"
     
@@ -97,20 +98,44 @@ class PropertyReportData:
     aerial_image_path: Optional[str] = None
     street_view_image_path: Optional[str] = None
 
+    # BOV table values (population, households, rings, employment, valuation, etc.)
+    table_values: Dict[str, str] = field(default_factory=dict)
+
+    # Additional BOV narrative sections
+    executive_summary: str = ""
+    regional_analysis: str = ""
+    sales_conclusion: str = ""
+    reconciliation_summary: str = ""
+
+    # Comparable sales extracted from uploaded CoStar PDF (optional)
+    comps: List[Any] = field(default_factory=list)
+    # Raw demographic dataset used for employment table refresh
+    bov_dataset: Dict = field(default_factory=dict)
+
 class ComprehensivePropertyReportGenerator:
-    def __init__(self, openai_api_key: str, google_api_key: str, template_path: str, output_dir: str = "output"):
+    def __init__(
+        self,
+        openai_api_key: str,
+        template_path: str,
+        output_dir: str = "output",
+        google_api_key: Optional[str] = None,
+        esri_api_key: Optional[str] = None,
+    ):
         """
         Initialize the Comprehensive Property Report Generator
         
         Args:
             openai_api_key: OpenAI API key
-            google_api_key: Google Maps API key
             template_path: Path to the Word document template
             output_dir: Directory to save generated reports
+            google_api_key: Google Maps API key (Street View; optional fallback)
+            esri_api_key: Esri API key (geocoding, aerial imagery, demographics)
         """
         self.openai_client = openai.OpenAI(api_key=openai_api_key)
-        self.gmaps = googlemaps.Client(key=google_api_key)
-        self.google_api_key = google_api_key
+        self.location_service = HybridLocationService(
+            esri_api_key=esri_api_key,
+            google_api_key=google_api_key,
+        )
         self.template_path = Path(template_path)
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(exist_ok=True)
@@ -140,103 +165,47 @@ class ComprehensivePropertyReportGenerator:
         street_view_path = None
         
         try:
-            # 1. Get Aerial/Satellite Image
-            logger.info("Fetching aerial image...")
-            aerial_params = {
-                "center": f"{lat},{lng}",
-                "zoom": "18",
-                "size": "1920x1920",
-                "maptype": "hybrid",
-                "key": self.google_api_key,
-                "markers": f"{lat},{lng}"
-            }
-            
-            aerial_response = requests.get(
-                "https://maps.googleapis.com/maps/api/staticmap", 
-                params=aerial_params,
-                timeout=30
-            )
-            aerial_response.raise_for_status()
-            
+            logger.info("Fetching aerial image via Esri (Google fallback)...")
             aerial_filename = f"aerial_{timestamp}.jpg"
-            aerial_path = self.images_dir / aerial_filename
-            with open(aerial_path, "wb") as f:
-                f.write(aerial_response.content)
-            logger.info(f"Aerial image saved: {aerial_path}")
-            
-            # 2. Get Street View Image
-            logger.info("Fetching Street View image...")
-            street_view_params = {
-                "size": "600x500",
-                "location": address,
-                "pitch": "0",
-                "fov": "90",
-                "key": self.google_api_key
-            }
-            
-            street_view_response = requests.get(
-                "https://maps.googleapis.com/maps/api/streetview", 
-                params=street_view_params,
-                timeout=30
+            aerial_path = self.location_service.get_aerial_image(
+                lat, lng, self.images_dir / aerial_filename
             )
-            street_view_response.raise_for_status()
-            
-            # Check if Street View is available
-            if street_view_response.headers.get('content-type', '').startswith('image/'):
-                street_view_filename = f"street_view_{timestamp}.jpg"
-                street_view_path = self.images_dir / street_view_filename
-                with open(street_view_path, "wb") as f:
-                    f.write(street_view_response.content)
-                logger.info(f"Street view image saved: {street_view_path}")
-            else:
-                logger.warning("Street View not available for this address")
+            if aerial_path:
+                logger.info("Aerial image saved: %s", aerial_path)
+
+            logger.info("Fetching Street View image via Google...")
+            street_view_filename = f"street_view_{timestamp}.jpg"
+            street_view_path = self.location_service.get_street_view_image(
+                address, self.images_dir / street_view_filename
+            )
+            if street_view_path:
+                logger.info("Street view image saved: %s", street_view_path)
                 
         except Exception as e:
             logger.error(f"Error fetching images: {e}")
             
-        return str(aerial_path) if aerial_path else None, str(street_view_path) if street_view_path else None
+        return aerial_path, street_view_path
 
     def get_coordinates_and_details(self, address: str) -> Tuple[float, float, Dict]:
         """
-        Get latitude, longitude, and detailed information from Google Geocoding API
+        Get latitude, longitude, and location details (Esri first, Google fallback).
         """
         try:
-            geocode_result = self.gmaps.geocode(address)
-            if not geocode_result:
-                raise ValueError(f"No geocoding results for address: {address}")
-            
-            location = geocode_result[0]['geometry']['location']
-            lat = location['lat']
-            lng = location['lng']
-            
-            # Extract address components
-            components = geocode_result[0]['address_components']
-            address_details = {}
-            
-            for component in components:
-                types = component['types']
-                if 'administrative_area_level_2' in types:
-                    address_details['county'] = component['long_name']
-                elif 'administrative_area_level_1' in types:
-                    address_details['state'] = component['long_name']
-                elif 'locality' in types:
-                    address_details['city'] = component['long_name']
-                elif 'postal_code' in types:
-                    address_details['zip_code'] = component['long_name']
-            
-            return lat, lng, address_details
-            
+            return self.location_service.geocode(address)
         except Exception as e:
             logger.error(f"Error getting coordinates for {address}: {e}")
             raise
 
     def get_census_data(self, lat: float, lng: float, county: str, state: str) -> Dict:
         """
-        Get demographic data from US Census API
+        Get demographic data from Esri GeoEnrichment, with AI fallback.
         """
         try:
-            # This is a simplified version - you'd need to implement actual Census API calls
-            # For now, we'll generate realistic data through AI
+            demographics = self.location_service.get_demographics(lat, lng)
+            if demographics:
+                logger.info("Using Esri GeoEnrichment demographics")
+                return demographics
+
             census_prompt = f"""
             Generate realistic and current demographic data for coordinates {lat}, {lng} in {county}, {state}.
             Include population statistics, household data, employment data, and economic factors.
@@ -308,13 +277,18 @@ class ComprehensivePropertyReportGenerator:
             response = self.openai_client.chat.completions.create(
                 model="gpt-4o",
                 messages=[
-                    {"role": "system", "content": "You are a commercial real estate market analyst. Provide current, realistic market data based on actual market conditions."},
+                    {"role": "system", "content": f"You are a commercial real estate market analyst. Provide current, realistic {current_quarter} market data specific to {county}, {state}. Return only valid JSON."},
                     {"role": "user", "content": prompt}
                 ],
-                temperature=0.1
+                temperature=0.2,
+                response_format={"type": "json_object"},
             )
-            
-            return json.loads(response.choices[0].message.content)
+
+            content = response.choices[0].message.content.strip()
+            # Strip accidental markdown fences before parsing
+            if content.startswith("```"):
+                content = content.split("```", 2)[1].lstrip("json").strip()
+            return json.loads(content)
         except Exception as e:
             logger.error(f"Error generating market data: {e}")
             # Return default data as fallback
@@ -339,17 +313,23 @@ class ComprehensivePropertyReportGenerator:
             }
 
     def _generate_market_overview(self, context: str, property_type: str, market_data: Dict) -> str:
-        """Generate market overview section"""
-        
-        county = context.split('County:')[1].split('\n')[0].strip()
-        state = context.split('State:')[1].split('\n')[0].strip()
-        
-        # Generate plain text without markdown formatting
-        overview = f"""{county}'s {property_type} market continues to evolve amid population growth, shifting economic conditions, and broader trends in commercial real estate. The region remains a hub for business expansion, driven by strong job growth and an increasing demand for adaptable {property_type} spaces. According to Utah Business, {state}'s population is projected to grow significantly, reaching nearly {market_data.get('population_projection_2060', 5500000)/1000000:.1f} million by 2060, fueling long-term demand for commercial real estate.
+        """Generate a location-specific market overview via AI (not a static template)."""
+        county = self._ctx_value(context, 'County')
+        state = self._ctx_value(context, 'State')
+        quarter = market_data.get('quarter', self._current_quarter())
 
-While vacancy rates have shown fluctuations, {county}'s labor market remains resilient, with an unemployment rate of {market_data.get('unemployment_rate', 3.8)}% in {datetime.now().strftime('%B %Y')}, below the national average of {market_data.get('national_unemployment', 4.4)}%. Businesses continue to reassess their space needs, leading to an increase in sublease availability and more flexible leasing agreements."""
-        
-        return overview
+        prompt = f"""Write a professional 2-paragraph market overview for the {property_type} market
+in {county}, {state}, as of {quarter}.
+
+Ground everything specifically in {county}, {state}. Do NOT reference any other state, county, or city.
+Incorporate these current metrics naturally in prose: total vacancy about {market_data.get('total_vacancy', 'n/a')}%,
+average asking lease rate about ${market_data.get('avg_lease_rate', 'n/a')}/SF, local unemployment about
+{market_data.get('unemployment_rate', 'n/a')}% versus the national average of about {market_data.get('national_unemployment', 'n/a')}%.
+
+Cover local population and employment growth drivers, demand for {property_type} space, and current leasing
+dynamics (e.g., sublease availability, flight to quality, hybrid-work effects where relevant).
+Plain text only. No markdown, no bullet points, no headings."""
+        return self._get_ai_response(prompt)
 
     def _generate_vacancy_rates(self, context: str, property_type: str, market_data: Dict) -> str:
         """Generate vacancy rates section with formatted data"""
@@ -364,98 +344,101 @@ While vacancy rates have shown fluctuations, {county}'s labor market remains res
         return vacancy_section
 
     def _generate_lease_rates(self, context: str, property_type: str, market_data: Dict) -> str:
-        """Generate lease rates section"""
-        
-        # Generate clean text without any formatting markers
-        lease_section = f"""-   Overall Average: ${market_data.get('avg_lease_rate', 24.33)}/SF (${market_data.get('lease_rate_yoy', '-0.04')} YoY)
+        """Generate lease rates section (data-driven, market-specific numbers)."""
+        lease_section = f"""-   Overall Average: ${market_data.get('avg_lease_rate', 'n/a')}/SF (${market_data.get('lease_rate_yoy', 'n/a')} YoY)
 
--   Class A: ${market_data.get('class_a_rate', 27.13)}/SF (Strongest in North Quadrant)
+-   Class A: ${market_data.get('class_a_rate', 'n/a')}/SF
 
--   Class B: ${market_data.get('class_b_rate', 22.03)}/SF
+-   Class B: ${market_data.get('class_b_rate', 'n/a')}/SF
 
--   Class C: ${market_data.get('class_c_rate', 19.44)}/SF"""
-        
+-   Class C: ${market_data.get('class_c_rate', 'n/a')}/SF"""
         return lease_section
 
     def _generate_construction_activity(self, context: str, property_type: str, market_data: Dict) -> str:
-        """Generate construction activity section"""
-        
-        construction_section = f"""Construction Activity
+        """Generate a location-specific construction activity section via AI."""
+        county = self._ctx_value(context, 'County')
+        state = self._ctx_value(context, 'State')
+        quarter = market_data.get('quarter', self._current_quarter())
+        construction_sf = market_data.get('construction_sf', 0) or 0
 
--   Under Construction: {market_data.get('construction_sf', 24000):,} SF (Primarily {market_data.get('construction_type', 'medical office')} projects)
+        prompt = f"""Write a short "Construction Activity" section for the {property_type} market in
+{county}, {state}, as of {quarter}.
 
--   Recently Completed: Two medical office buildings near Primary Children's Hospital in Lehi"""
-        
-        return construction_section
+Use these figures: approximately {int(construction_sf):,} SF under construction, primarily
+{market_data.get('construction_type', property_type)} product.
+Reference realistic, plausible recent deliveries and pipeline trends specific to {county}, {state}.
+Do NOT reference any other market (no Salt Lake, Lehi, Provo, etc. unless that is the actual county/state).
+
+Return 2-3 concise bullet points, each starting with "-   ". Plain text only."""
+        return self._get_ai_response(prompt)
 
     def _generate_market_trends(self, context: str, property_type: str, market_data: Dict) -> str:
-        """Generate market trends section"""
-        
-        county = context.split('County:')[1].split('\n')[0].strip()
-        state = context.split('State:')[1].split('\n')[0].strip()
-        
-        trends_template = f"""Population Growth Drives {property_type} Demand:
+        """Generate location-specific market trends via AI."""
+        county = self._ctx_value(context, 'County')
+        state = self._ctx_value(context, 'State')
+        quarter = market_data.get('quarter', self._current_quarter())
+        trends = ", ".join(market_data.get('major_trends', []) or [])
 
--   {state}'s long-term population growth projections indicate sustained demand for {property_type} space as new businesses enter the market.
-
-Flexible Leasing & Sublease Opportunities:
-
--   As companies adjust their real estate strategies, sublease availability has increased, providing cost-saving opportunities for tenants.
-
-Industrial Space Trends Impact {property_type} Demand:
-
--   With 2.8 million square feet of industrial space available for sublease in Salt Lake City, businesses are re-evaluating their commercial space needs, affecting {property_type} leasing decisions.
-
-{property_type} Market Adjusts to Hybrid Work Models:
-
--   The trend toward remote and hybrid work models continues to impact demand for traditional {property_type} spaces, though Class A properties remain in high demand."""
-        
-        return trends_template
+        prompt = f"""Write a "Trends & Forecast" section for the {property_type} market in {county}, {state}, as of {quarter}.
+{f'Relevant current themes to weave in: {trends}.' if trends else ''}
+Cover 3-4 distinct trends (e.g., population/employment growth, leasing flexibility/sublease, supply pipeline,
+hybrid-work or e-commerce effects) as they specifically apply to {county}, {state} and to {property_type}.
+Do NOT reference any other market. Format each trend as a short bolded-style label line followed by a "-   " bullet.
+Plain text only, no markdown symbols."""
+        return self._get_ai_response(prompt)
 
     def _generate_investment_insights(self, context: str, property_type: str, market_data: Dict) -> str:
-        """Generate investment insights section"""
-        
-        county = context.split('County:')[1].split('\n')[0].strip()
-        
-        insights = f"""-   Strategic Location Selection: Investors should focus on areas experiencing high population and business growth, particularly in North {county}.
+        """Generate location-specific investment insights via AI."""
+        county = self._ctx_value(context, 'County')
+        state = self._ctx_value(context, 'State')
 
--   Short-Term Leasing Gains Popularity: Many tenants are opting for shorter lease terms or subleases to maintain flexibility.
-
--   Medical Office Space Resilience: Healthcare-driven office developments remain a stable investment option, given the ongoing expansion of medical services."""
-        
-        return insights
+        prompt = f"""Write "Investment Insights" for a {property_type} property in {county}, {state}.
+Provide 3 concise, actionable insights grounded in the local {county}, {state} market and {property_type} fundamentals.
+Do NOT reference any other market. Return 3 bullet points, each starting with "-   " and leading with a short bold-style label.
+Plain text only."""
+        return self._get_ai_response(prompt)
 
     def _generate_market_recommendations(self, context: str, property_type: str, market_data: Dict) -> str:
-        """Generate market recommendations section"""
-        
-        recommendations = f"""-   For Investors: Target Class A {property_type} properties in growth corridors and areas with sustained business demand.
+        """Generate location-specific recommendations via AI."""
+        county = self._ctx_value(context, 'County')
+        state = self._ctx_value(context, 'State')
 
--   For Tenants: Leverage sublease opportunities to secure flexible lease terms at lower rental rates.
+        prompt = f"""Write "Recommendations" for a {property_type} BOV in {county}, {state}.
+Give 3 recommendations addressed to Investors, Tenants, and Developers respectively, grounded in current
+{county}, {state} {property_type} conditions. Do NOT reference any other market.
+Return 3 bullet points, each starting with "-   " and leading with the audience label. Plain text only."""
+        return self._get_ai_response(prompt)
 
--   For Developers: Prioritize medical office projects and mixed-use spaces to align with evolving work trends."""
-        
-        return recommendations
+    def _generate_data_sources(self, context: str = "", property_type: str = "", market_data: Dict = None) -> str:
+        """Generate a current, market-relevant data sources list via AI."""
+        market_data = market_data or {}
+        county = self._ctx_value(context, 'County')
+        state = self._ctx_value(context, 'State')
+        quarter = market_data.get('quarter', self._current_quarter())
+        year = datetime.now().year
 
-    def _generate_data_sources(self) -> str:
-        """Generate data sources and disclaimer section"""
-        
-        current_quarter = f"Q{(datetime.now().month-1)//3 + 1} {datetime.now().year}"
-        
-        sources = f"""Sources Used:
+        prompt = f"""List 6 realistic, current ({year}) data sources that would support a {property_type} Broker Opinion
+of Value in {county}, {state}, as of {quarter}.
+Include a mix of: a major brokerage market report relevant to the {county}/{state} metro, US Census Bureau,
+Esri GeoEnrichment / Business Analyst, U.S. Bureau of Labor Statistics, a local/regional economic development
+or business source, and public county assessor/property records.
+Every source must be dated {year} (or "current"/"latest"), never older than the last two years.
+Do NOT invent Utah-specific sources unless the property is in Utah.
+Start with the line "Sources Used:" then a numbered list "1. ", "2. ", etc. Plain text only."""
+        return self._get_ai_response(prompt)
 
-1.  Colliers International {current_quarter} Utah County Office Report – Vacancy & Lease Rate Data
+    @staticmethod
+    def _ctx_value(context: str, label: str) -> str:
+        """Safely pull a labelled value (e.g. 'County') out of the context block."""
+        try:
+            return context.split(f'{label}:')[1].split('\n')[0].strip()
+        except (IndexError, AttributeError):
+            return ""
 
-2.  Utah Business – State Population Growth Projections
-
-3.  Newmark Research Report – Greater Salt Lake Office Market Trends
-
-4.  Hughes Marino Report – Industrial & Commercial Leasing Data
-
-5.  Public Property Data – Vacancy and Lease Rate Trends
-
-6.  National Market Insights – Hybrid Work and Office Space Adjustments"""
-        
-        return sources
+    @staticmethod
+    def _current_quarter() -> str:
+        now = datetime.now()
+        return f"Q{(now.month - 1) // 3 + 1} {now.year}"
 
     def _generate_market_analysis_sections(self, context: str, property_type: str) -> Dict[str, str]:
         """Generate all market analysis sections"""
@@ -474,7 +457,7 @@ Industrial Space Trends Impact {property_type} Demand:
             'market_trends': self._generate_market_trends(context, property_type, market_data),
             'investment_insights': self._generate_investment_insights(context, property_type, market_data),
             'market_recommendations': self._generate_market_recommendations(context, property_type, market_data),
-            'market_data_sources': self._generate_data_sources()
+            'market_data_sources': self._generate_data_sources(context, property_type, market_data)
         }
         
         return sections
@@ -486,11 +469,20 @@ Industrial Space Trends Impact {property_type} Demand:
         logger.info(f"Generating comprehensive content for: {address}")
         
         # Create detailed context for AI
+        transaction = ""
+        if property_data.lease_or_sale:
+            kind = property_data.lease_or_sale.strip().lower()
+            if "lease" in kind:
+                transaction = "Transaction Context: The property is being evaluated for LEASE."
+            else:
+                transaction = "Transaction Context: The property is being evaluated for SALE."
         context = f"""
         Property Address: {address}
+        Property Type: {property_data.property_type}
         County: {property_data.county}
         State: {property_data.state}
         Coordinates: {property_data.latitude}, {property_data.longitude}
+        {transaction}
         """
         
         # Generate property analysis sections
@@ -537,8 +529,53 @@ Industrial Space Trends Impact {property_type} Demand:
         property_data.investment_insights = market_sections['investment_insights']
         property_data.market_recommendations = market_sections['market_recommendations']
         property_data.market_data_sources = market_sections['market_data_sources']
-        
+
+        comp_context = self._format_comp_context(property_data.comps)
+
+        # Generate additional BOV narrative sections
+        property_data.executive_summary = self._get_ai_response(
+            f"Write a concise 1-paragraph executive summary for a Broker Opinion of Value of a "
+            f"{property_data.property_type} property. Context:\n{context}\n"
+            f"{comp_context}"
+            f"Summarize location, key value drivers, and the value conclusion. Plain text only.",
+        )
+        property_data.regional_analysis = self._get_ai_response(
+            f"Write a detailed 2-paragraph regional analysis for the area around the subject property, "
+            f"grounded specifically in {property_data.county}, {property_data.state}. "
+            f"Cover: population size and growth trend, household composition and income levels, key employers "
+            f"and industries, transportation/accessibility, and how these support demand for "
+            f"{property_data.property_type} space. Use recent ({datetime.now().year}) framing and consistent "
+            f"structure. Do not reference any other market. Context:\n{context}\nPlain text only.",
+        )
+        property_data.sales_conclusion = self._get_ai_response(
+            f"Write a 1-paragraph sales conclusion for a {property_data.property_type} BOV that ties "
+            f"the comparable sales to the concluded market value. Context:\n{context}\n"
+            f"{comp_context}"
+            f"Plain text only.",
+        )
+        property_data.reconciliation_summary = self._get_ai_response(
+            f"Write a 1-paragraph reconciliation summary explaining how the sales comparison approach "
+            f"supports the opinion of value for this {property_data.property_type}. Reference the comp "
+            f"price/SF range when comparable data is provided. Context:\n{context}\n"
+            f"{comp_context}"
+            f"Plain text only.",
+        )
+
         return property_data
+
+    @staticmethod
+    def _format_comp_context(comps: List[Any]) -> str:
+        if not comps:
+            return ""
+        lines = ["Comparable sales from uploaded CoStar PDF:"]
+        for comp in sorted(comps, key=lambda c: getattr(c, "comp_number", 0))[:6]:
+            lines.append(
+                f"- Comp {getattr(comp, 'comp_number', '?')}: {getattr(comp, 'address', '')}, "
+                f"Sale {getattr(comp, 'sale_price', 'N/A')}, "
+                f"{getattr(comp, 'sale_price_sf', 'N/A')}/SF, "
+                f"{getattr(comp, 'comp_sf', '')} SF"
+            )
+        return "\n".join(lines) + "\n"
 
     def _generate_property_summary(self, context: str) -> str:
         """Generate property summary matching the exact format"""
@@ -560,14 +597,20 @@ Industrial Space Trends Impact {property_type} Demand:
         example = """The subject is located on the corner of Hwy 198 and Elk Ridge Drive with good access and exposure. A major thoroughfare in the area is Hwy 198 which partially fronts the subject. The location also offers very close proximity to Salem Pond, Salem High School, Salem Community Center, Salem City Recreation, with limited retail areas in close proximity. The subject is surrounded by vacant land and residential uses. Utah County is broken up into three sectors.  North County (Lindon to Lehi) Central County (Provo/Orem) and South County (Springville to Payson). Central county accounts for a lot of the class B office buildings. The following is taken from Reis, it shows the market area with an arrow pointing to the subject."""
         
         prompt = f"""
-        Generate a location summary paragraph following this EXACT format and style:
+        Generate a DETAILED location summary following this FORMAT and style (adapt fully to the real location):
         {example}
-        
+
         Use this context: {context}
-        
-        Include: specific location details, access/exposure, nearby amenities, surrounding land uses, and county/market subdivisions.
+
+        Write a thorough 6-9 sentence description. Include, when applicable to the actual location:
+        - the specific corridor/intersection and major thoroughfares fronting or serving the site
+        - access and visibility/exposure characteristics
+        - nearby anchors, retail, employers, schools, parks, and other notable amenities (name plausible real ones for that area)
+        - surrounding land uses and development character
+        - how the site sits within the broader county/metro and its submarket subdivisions
+        Match the older template's level of detail. Plain text only, no markdown.
         """
-        
+
         return self._get_ai_response(prompt)
 
     def _generate_demographic_analysis(self, context: str) -> str:
@@ -620,18 +663,22 @@ Industrial Space Trends Impact {property_type} Demand:
         return self._get_ai_response(prompt)
 
     def _generate_employment_analysis(self, context: str) -> str:
-        """Generate employment analysis"""
-        example = """Total employment has increased annually over the past decade in the state of Utah by 2.5% and increased annually by 3.9% in the county. From 2018 to 2019 unemployment decreased in Utah by 0.4% and decreased by 0.4% in the county. In the state of Utah unemployment has decreased over the previous month by 1.0% and decreased by 0.7% in the county."""
-        
+        """Generate employment analysis using the most recent years available."""
+        year = datetime.now().year
+        example = f"""Total employment has increased annually over the past three years in the state by roughly 2.5% and by roughly 3.9% in the county. From {year-1} to {year} unemployment fell in the state by about 0.4% and by about 0.4% in the county, with the county's rate remaining below the national average. Over the most recent month, unemployment declined by about 0.3% at both the state and county level."""
+
         prompt = f"""
-        Generate an employment analysis paragraph following this EXACT format and style:
+        Generate an employment analysis paragraph following this FORMAT and style (do not copy its numbers):
         {example}
-        
+
         Use this context: {context}
-        
-        Include: employment growth rates, unemployment trends, state vs county comparisons, recent changes. Use current 2024 employment data.
+
+        Requirements:
+        - Use the MOST RECENT data available (reference {year-2}-{year}); never cite a decade-old range such as 2010-2019.
+        - Include: recent employment growth rates, unemployment trends, state vs county comparisons, and the latest month-over-month change.
+        - Base facts on the specific state and county in the context. Plain text only.
         """
-        
+
         return self._get_ai_response(prompt)
 
     def _generate_economic_factors(self, context: str) -> str:
@@ -694,14 +741,17 @@ Industrial Space Trends Impact {property_type} Demand:
     def _get_ai_response(self, prompt: str, json_response: bool = False) -> str:
         """Get response from OpenAI API"""
         try:
-            response = self.openai_client.chat.completions.create(
-                model="gpt-4o",
-                messages=[
-                    {"role": "system", "content": "You are a professional real estate analyst. Maintain exact formatting and style as shown in examples. Provide factual, current information." + (" Respond in valid JSON format." if json_response else "")},
+            kwargs = {
+                "model": "gpt-4o",
+                "messages": [
+                    {"role": "system", "content": "You are a professional commercial real estate analyst. Use the example only for FORMAT/style; base all facts on the specific location provided in the context. Never reference Utah, Salt Lake, Provo, or Lehi unless the subject property is actually there. Provide factual, current information." + (" Respond in valid JSON format." if json_response else "")},
                     {"role": "user", "content": prompt}
                 ],
-                temperature=0.2
-            )
+                "temperature": 0.3,
+            }
+            if json_response:
+                kwargs["response_format"] = {"type": "json_object"}
+            response = self.openai_client.chat.completions.create(**kwargs)
             return response.choices[0].message.content.strip()
         except Exception as e:
             logger.error(f"Error getting AI response: {e}")
@@ -710,9 +760,11 @@ Industrial Space Trends Impact {property_type} Demand:
     def create_property_report(self, 
                              address: str,
                              prepared_by: str = "",
+                             prepared_by_title: str = "",
                              prepared_by_company: str = "",
                              prepared_by_address: str = "",
                              prepared_for: str = "",
+                             prepared_for_title: str = "",
                              prepared_for_company: str = "",
                              prepared_for_address: str = "",
                              property_name: str = "",
@@ -722,6 +774,8 @@ Industrial Space Trends Impact {property_type} Demand:
         Create complete property report data
         """
         logger.info(f"Creating property report for: {address}")
+
+        comps = kwargs.pop("comps", None) or []
         
         # Get coordinates and location details
         lat, lng, address_details = self.get_coordinates_and_details(address)
@@ -730,9 +784,11 @@ Industrial Space Trends Impact {property_type} Demand:
         property_data = PropertyReportData(
             address=address,
             prepared_by=prepared_by,
+            prepared_by_title=prepared_by_title,
             prepared_by_company=prepared_by_company,
             prepared_by_address=prepared_by_address,
             prepared_for=prepared_for,
+            prepared_for_title=prepared_for_title,
             prepared_for_company=prepared_for_company,
             prepared_for_address=prepared_for_address,
             property_name=property_name or f"{address_details.get('city', 'Property')} {property_type}",
@@ -748,11 +804,491 @@ Industrial Space Trends Impact {property_type} Demand:
         aerial_path, street_view_path = self.get_property_images(address, lat, lng)
         property_data.aerial_image_path = aerial_path
         property_data.street_view_image_path = street_view_path
+        property_data.comps = comps
         
         # Generate all content sections (including market analysis)
         property_data = self.generate_comprehensive_content(address, property_data)
-        
+
+        # Build BOV table values (Esri GeoEnrichment first, AI fallback)
+        try:
+            lat_f = float(property_data.latitude)
+            lng_f = float(property_data.longitude)
+        except (TypeError, ValueError):
+            lat_f, lng_f = 0.0, 0.0
+        property_data.table_values = self.build_bov_dataset(
+            lat_f, lng_f, property_data
+        )
+
         return property_data
+
+    def build_bov_dataset(self, lat: float, lng: float, property_data: "PropertyReportData") -> Dict[str, str]:
+        """Build the full set of BOV table placeholder values.
+
+        Strategy: generate a complete realistic dataset with AI, then overlay
+        real Esri GeoEnrichment numbers where the Esri key is available.
+        """
+        county = property_data.county or "the county"
+        state = property_data.state or "the state"
+        property_type = property_data.property_type or "Commercial"
+
+        dataset = self._generate_bov_demographics_ai(county, state, property_type)
+
+        # Use the entered GBA (Gross Building Area) to drive the valuation math
+        gba = self._to_number(property_data.lot_area)
+        if gba:
+            valuation = dataset.setdefault("valuation", {})
+            price_psf = self._to_number(valuation.get("price_psf")) or 265.0
+            valuation["building_sf"] = gba
+            valuation["price_psf"] = price_psf
+            market_value = price_psf * gba
+            valuation["market_value"] = market_value
+            valuation["market_value_rounded"] = round(market_value / 10000) * 10000
+            valuation["value_aggressive"] = round(market_value * 1.04)
+            valuation["value_conservative"] = round(market_value * 0.96)
+
+        # Overlay real Esri ring demographics when available
+        try:
+            rings = self.location_service.get_ring_demographics(lat, lng)
+            if rings:
+                self._overlay_esri_rings(dataset, rings)
+                dataset["demographics_source"] = "Esri GeoEnrichment"
+                logger.info("Overlaid real Esri ring demographics onto BOV dataset")
+        except Exception as exc:
+            logger.warning("Could not overlay Esri ring demographics: %s", exc)
+
+        # Overlay point-level Esri county employment / population when available
+        try:
+            county_demo = self.location_service.get_demographics(lat, lng)
+            if county_demo:
+                self._overlay_esri_county(dataset, county_demo)
+                dataset["demographics_source"] = "Esri GeoEnrichment"
+                logger.info("Overlaid Esri county demographics (employment/population)")
+        except Exception as exc:
+            logger.warning("Could not overlay Esri county demographics: %s", exc)
+
+        property_data.bov_dataset = dataset
+        return self._format_bov_placeholders(dataset, property_data)
+
+    def _overlay_esri_county(self, dataset: Dict, county_demo: Dict) -> None:
+        """Apply Esri point demographics to employment / population summary fields."""
+        emp = dataset.setdefault("employment", {})
+        emp.setdefault("total_employment", {})
+        emp.setdefault("unemployment_rate", {})
+
+        if county_demo.get("employment_count") is not None:
+            emp["total_employment"]["county"] = int(county_demo["employment_count"])
+        if county_demo.get("unemployment_rate") is not None:
+            emp["unemployment_rate"]["county"] = float(county_demo["unemployment_rate"])
+        if county_demo.get("population_current") is not None:
+            pop = dataset.setdefault("population", {})
+            pop.setdefault("2025", {})
+            pop["2025"]["county"] = int(county_demo["population_current"])
+
+    @staticmethod
+    def _to_number(value):
+        """Parse a number from strings like '24,500' or '708711'; None if not numeric."""
+        if value is None:
+            return None
+        try:
+            return float(str(value).replace(",", "").replace("$", "").strip())
+        except (TypeError, ValueError):
+            return None
+
+    def _generate_bov_demographics_ai(self, county: str, state: str, property_type: str) -> Dict:
+        """Generate a complete demographic + valuation dataset as JSON via AI."""
+        prompt = f"""
+        Generate realistic current demographic, employment, and valuation data for a {property_type}
+        property in {county}, {state}. Base values on plausible US Census, Esri, and BLS figures.
+        Use the most recent years available ({datetime.now().year - 5} through {datetime.now().year}) for
+        employment_history — never use 2010-2019 ranges.
+
+        Return ONLY valid JSON with this exact structure (numbers as plain integers/decimals,
+        no commas, no $ signs):
+        {{
+          "population": {{
+            "2010": {{"us": 308745538, "state": 25145561, "county": 2368139}},
+            "2020": {{"us": 331449281, "state": 29145505, "county": 2613539}},
+            "2025": {{"us": 340110988, "state": 30500000, "county": 2640000}}
+          }},
+          "density": {{
+            "2020": {{"us": 92, "state": 108, "county": 2985}},
+            "2025": {{"us": 94, "state": 113, "county": 2982}}
+          }},
+          "households": {{
+            "2024": {{"us": 131000000, "state": 11000000, "county": 982000}},
+            "2029": {{"us": 138000000, "state": 12500000, "county": 1037000}},
+            "cagr": {{"us": 1.4, "state": 2.6, "county": 1.1}}
+          }},
+          "hh_size": {{
+            "2024": {{"us": 2.52, "state": 2.66, "county": 2.62}},
+            "2029": {{"us": 2.42, "state": 2.50, "county": 2.46}},
+            "cagr": {{"us": -0.8, "state": -1.3, "county": -1.2}}
+          }},
+          "tenure": {{
+            "owner": {{"us": 65.0, "state": 62.6, "county": 50.8}},
+            "renter": {{"us": 35.0, "state": 37.4, "county": 49.2}}
+          }},
+          "rings": {{
+            "1": {{"pop_2024": 13000, "pop_2029": 13100, "hh_2024": 4600, "hh_2029": 4800, "avg_hh_income": 150000, "median_hh_income": 120000, "per_capita_income": 65000, "owner_pct": 60.5, "renter_pct": 39.5}},
+            "3": {{"pop_2024": 95000, "pop_2029": 96000, "hh_2024": 39000, "hh_2029": 42000, "avg_hh_income": 140000, "median_hh_income": 99000, "per_capita_income": 58000, "owner_pct": 41.7, "renter_pct": 58.3}},
+            "5": {{"pop_2024": 218000, "pop_2029": 222000, "hh_2024": 86000, "hh_2029": 93000, "avg_hh_income": 140000, "median_hh_income": 103000, "per_capita_income": 55000, "owner_pct": 46.1, "renter_pct": 53.9}}
+          }},
+          "employment": {{
+            "total_employment": {{"us": 161000000, "state": 14500000, "county": 1350000}},
+            "unemployment_rate": {{"us": 4.1, "state": 4.0, "county": 3.8}}
+          }},
+          "employment_history": [
+            {{"year": 2020, "state_emp": 12500000, "state_emp_yoy": -2.1, "state_unemp": 6.8,
+              "county_emp": 1200000, "county_emp_yoy": -1.9, "county_unemp": 6.5,
+              "us_emp": 147000000, "us_unemp": 8.1}},
+            {{"year": 2021, "state_emp": 12800000, "state_emp_yoy": 2.4, "state_unemp": 5.4,
+              "county_emp": 1230000, "county_emp_yoy": 2.5, "county_unemp": 5.1,
+              "us_emp": 150000000, "us_unemp": 5.4}},
+            {{"year": 2022, "state_emp": 13100000, "state_emp_yoy": 2.3, "state_unemp": 4.0,
+              "county_emp": 1260000, "county_emp_yoy": 2.4, "county_unemp": 3.8,
+              "us_emp": 153000000, "us_unemp": 3.6}},
+            {{"year": 2023, "state_emp": 13350000, "state_emp_yoy": 1.9, "state_unemp": 3.8,
+              "county_emp": 1285000, "county_emp_yoy": 2.0, "county_unemp": 3.6,
+              "us_emp": 155500000, "us_unemp": 3.6}},
+            {{"year": 2024, "state_emp": 13580000, "state_emp_yoy": 1.7, "state_unemp": 3.9,
+              "county_emp": 1302000, "county_emp_yoy": 1.3, "county_unemp": 3.7,
+              "us_emp": 157800000, "us_unemp": 3.9}},
+            {{"year": 2025, "state_emp": 13750000, "state_emp_yoy": 1.3, "state_unemp": 3.8,
+              "county_emp": 1318000, "county_emp_yoy": 1.2, "county_unemp": 3.5,
+              "us_emp": 159500000, "us_unemp": 4.0}}
+          ],
+          "valuation": {{
+            "price_psf": 265.00, "building_sf": 24500,
+            "market_value": 6492500, "market_value_rounded": 6490000,
+            "value_aggressive": 6752200, "value_conservative": 6232800
+          }}
+        }}
+        """
+        try:
+            response = self.openai_client.chat.completions.create(
+                model="gpt-4o",
+                messages=[
+                    {"role": "system", "content": "You are a real estate data analyst. Return only valid JSON, no markdown."},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0.1,
+                response_format={"type": "json_object"},
+            )
+            return json.loads(response.choices[0].message.content)
+        except Exception as exc:
+            logger.error("BOV demographics AI generation failed: %s", exc)
+            return {}
+
+    def _overlay_esri_rings(self, dataset: Dict, rings: Dict[str, Dict]) -> None:
+        """Replace AI ring numbers with real Esri values where present."""
+        dataset.setdefault("rings", {})
+        esri_map = {
+            "pop_2024": ("TOTPOP_CY", "TOTPOP_FY"),
+            "hh_2024": ("TOTHH_CY",),
+            "avg_hh_income": ("AVGHINC_CY", "AVGHHINC_CY"),
+            "median_hh_income": ("MEDHINC_CY",),
+            "per_capita_income": ("PCI_CY",),
+        }
+        for radius, attributes in rings.items():
+            target = dataset["rings"].setdefault(radius, {})
+            for field_name, esri_keys in esri_map.items():
+                for key in esri_keys:
+                    if attributes.get(key) is not None:
+                        target[field_name] = attributes[key]
+                        break
+
+    def _format_bov_placeholders(self, dataset: Dict, property_data: "PropertyReportData") -> Dict[str, str]:
+        """Flatten the dataset dict into {{placeholder}} -> formatted string values."""
+
+        def num(value, decimals=0):
+            if value is None or value == "":
+                return "—"
+            try:
+                if decimals:
+                    return f"{float(value):,.{decimals}f}"
+                return f"{int(round(float(value))):,}"
+            except (TypeError, ValueError):
+                return str(value)
+
+        def money(value, decimals=0):
+            formatted = num(value, decimals)
+            return f"${formatted}" if formatted != "—" else "—"
+
+        def pct(value):
+            if value is None or value == "":
+                return "—"
+            try:
+                return f"{float(value):.1f}%"
+            except (TypeError, ValueError):
+                return str(value)
+
+        v: Dict[str, str] = {}
+        geos = ("us", "state", "county")
+
+        pop = dataset.get("population", {})
+        for year in ("2010", "2020", "2025"):
+            for g in geos:
+                v[f"{{{{pop_{year}_{g}}}}}"] = num(pop.get(year, {}).get(g))
+
+        density = dataset.get("density", {})
+        for year in ("2020", "2025"):
+            for g in geos:
+                v[f"{{{{density_{year}_{g}}}}}"] = num(density.get(year, {}).get(g))
+
+        hh = dataset.get("households", {})
+        for key in ("2024", "2029"):
+            for g in geos:
+                v[f"{{{{hh_{key}_{g}}}}}"] = num(hh.get(key, {}).get(g))
+        for g in geos:
+            v[f"{{{{hh_cagr_{g}}}}}"] = pct(hh.get("cagr", {}).get(g))
+
+        hs = dataset.get("hh_size", {})
+        for key in ("2024", "2029"):
+            for g in geos:
+                v[f"{{{{hhsize_{key}_{g}}}}}"] = num(hs.get(key, {}).get(g), 2)
+        for g in geos:
+            v[f"{{{{hhsize_cagr_{g}}}}}"] = pct(hs.get("cagr", {}).get(g))
+
+        tenure = dataset.get("tenure", {})
+        for g in geos:
+            v[f"{{{{owner_{g}}}}}"] = pct(tenure.get("owner", {}).get(g))
+            v[f"{{{{renter_{g}}}}}"] = pct(tenure.get("renter", {}).get(g))
+
+        rings = dataset.get("rings", {})
+        for r in ("1", "3", "5"):
+            ring = rings.get(r, {})
+            v[f"{{{{r{r}_pop_2024}}}}"] = num(ring.get("pop_2024"))
+            v[f"{{{{r{r}_pop_2029}}}}"] = num(ring.get("pop_2029"))
+            v[f"{{{{r{r}_hh_2024}}}}"] = num(ring.get("hh_2024"))
+            v[f"{{{{r{r}_hh_2029}}}}"] = num(ring.get("hh_2029"))
+            v[f"{{{{r{r}_avg_hh_income}}}}"] = money(ring.get("avg_hh_income"))
+            v[f"{{{{r{r}_median_hh_income}}}}"] = money(ring.get("median_hh_income"))
+            v[f"{{{{r{r}_per_capita_income}}}}"] = money(ring.get("per_capita_income"))
+            v[f"{{{{r{r}_owner_pct}}}}"] = pct(ring.get("owner_pct"))
+            v[f"{{{{r{r}_renter_pct}}}}"] = pct(ring.get("renter_pct"))
+
+        emp = dataset.get("employment", {})
+        for g in geos:
+            v[f"{{{{emp_total_{g}}}}}"] = num(emp.get("total_employment", {}).get(g))
+            v[f"{{{{unemp_{g}}}}}"] = pct(emp.get("unemployment_rate", {}).get(g))
+
+        val = dataset.get("valuation", {})
+        v["{{market_price_psf}}"] = money(val.get("price_psf"), 2)
+        v["{{market_building_sf}}"] = num(val.get("building_sf"))
+        v["{{market_value}}"] = money(val.get("market_value"))
+        v["{{market_value_rounded}}"] = money(val.get("market_value_rounded"))
+        v["{{value_aggressive}}"] = money(val.get("value_aggressive"))
+        v["{{value_conservative}}"] = money(val.get("value_conservative"))
+
+        v["{{demographics_source}}"] = dataset.get("demographics_source", "US Census, Esri, BLS")
+        v["{{address}}"] = property_data.address
+        v["{{executive_summary}}"] = property_data.executive_summary
+        v["{{regional_analysis}}"] = property_data.regional_analysis
+        v["{{sales_conclusion}}"] = property_data.sales_conclusion
+        v["{{reconciliation_summary}}"] = property_data.reconciliation_summary
+        return v
+
+    @staticmethod
+    def _insert_paragraph_after(paragraph):
+        """Insert a new empty paragraph immediately after `paragraph`."""
+        from docx.oxml import OxmlElement
+        from docx.text.paragraph import Paragraph
+
+        new_p = OxmlElement("w:p")
+        paragraph._element.addnext(new_p)
+        return Paragraph(new_p, paragraph._parent)
+
+    def _insert_comparables(self, doc: Document, comps: List[Any]) -> None:
+        """Insert extracted comparable sales after the PROPERTY COMPARABLES heading."""
+        heading_idx = None
+        for i, p in enumerate(doc.paragraphs):
+            if "PROPERTY COMPARABLES" in p.text.upper():
+                heading_idx = i
+                break
+        if heading_idx is None:
+            return
+
+        anchor = doc.paragraphs[heading_idx]
+        sorted_comps = sorted(comps, key=lambda c: getattr(c, "comp_number", 0))[:6]
+
+        for comp in sorted_comps:
+            title_p = self._insert_paragraph_after(anchor)
+            run = title_p.add_run(
+                f"Comparable {getattr(comp, 'comp_number', '')}: {getattr(comp, 'property_name', 'Property')}"
+            )
+            run.bold = True
+            anchor = title_p
+
+            details = []
+            for label, val in (
+                ("Address", getattr(comp, "address", "")),
+                ("Primary Use", getattr(comp, "primary_use", "")),
+                ("Market / Submarket", f"{getattr(comp, 'market', '')} / {getattr(comp, 'sub_market', '')}".strip(" /")),
+                ("Comp SF", getattr(comp, "comp_sf", "")),
+                ("Acres", getattr(comp, "acres", "")),
+                ("Sale Price", getattr(comp, "sale_price", "")),
+                ("Sale Price/SF", getattr(comp, "sale_price_sf", "")),
+                ("Zoning", getattr(comp, "zoning", "")),
+                ("Sale Date", getattr(comp, "off_market_date", "")),
+                ("Seller", getattr(comp, "seller_landlord", "")),
+                ("Buyer", getattr(comp, "buyer_tenant", "")),
+            ):
+                if val and str(val).strip():
+                    details.append(f"{label}: {val}")
+
+            if details:
+                detail_p = self._insert_paragraph_after(anchor)
+                detail_p.add_run("\n".join(details))
+                anchor = detail_p
+
+            image_path = getattr(comp, "image_path", None)
+            if image_path and os.path.exists(image_path):
+                img_p = self._insert_paragraph_after(anchor)
+                try:
+                    img_p.add_run().add_picture(image_path, width=Inches(5.5))
+                    anchor = img_p
+                except Exception as exc:
+                    logger.warning("Could not insert comp image: %s", exc)
+
+        logger.info("Inserted %d comparable properties into BOV report", len(sorted_comps))
+
+    def _fill_employment_table(self, doc: Document, dataset: Dict, county: str, state: str) -> None:
+        """Replace legacy 2010-2019 employment table years with recent data."""
+        if len(doc.tables) < 10:
+            return
+        history = dataset.get("employment_history") or []
+        if not history:
+            return
+
+        table = doc.tables[9]
+        year_rows = {int(r["year"]): r for r in history if r.get("year")}
+        year_shift = {2010 + i: 2020 + i for i in range(10)}
+
+        def fmt_num(n):
+            try:
+                return f"{int(round(float(n))):,}"
+            except (TypeError, ValueError):
+                return str(n)
+
+        def fmt_pct(n):
+            try:
+                return f"{float(n):.1f}%"
+            except (TypeError, ValueError):
+                return str(n)
+
+        for row in table.rows:
+            for cell in row.cells:
+                text = cell.text.strip()
+                if re.fullmatch(r"20\d{2}", text):
+                    yr = int(text)
+                    target_year = year_shift.get(yr, yr)
+                    if target_year in year_rows:
+                        cell.text = str(target_year)
+                    elif yr in year_rows:
+                        cell.text = str(yr)
+
+        # Update header to reflect data era
+        try:
+            hdr = table.rows[0].cells[0].paragraphs[0]
+            if hdr.text and "2010" in hdr.text:
+                hdr.text = hdr.text.replace("2010-2019", f"2020-{datetime.now().year}")
+                hdr.text = hdr.text.replace("2010", "2020")
+        except Exception:
+            pass
+
+        logger.info("Refreshed employment table with %d recent-year records", len(year_rows))
+
+    def _replace_in_textboxes(self, doc: Document, replacements: Dict[str, str]):
+        """Replace placeholders inside text boxes (cover, side bars) and headers/footers.
+
+        Text-box runs are not reachable via doc.paragraphs, so we walk the raw
+        w:t nodes. The templatizer keeps each placeholder within a single run, so
+        a per-node substring replace is safe.
+        """
+        from docx.oxml.ns import qn
+
+        w_t = qn("w:t")
+
+        def process(root):
+            if root is None:
+                return
+            for node in root.iter(w_t):
+                if not node.text:
+                    continue
+                new_text = node.text
+                for placeholder, value in replacements.items():
+                    if placeholder in new_text:
+                        new_text = new_text.replace(placeholder, value if value is not None else "")
+                if new_text != node.text:
+                    node.text = new_text
+
+        process(doc.element.body)
+        for section in doc.sections:
+            for part in (section.header, section.footer):
+                try:
+                    process(part._element)
+                except Exception:
+                    pass
+
+    def _replace_textbox_images(self, doc: Document, image_map: Dict[str, tuple]):
+        """Swap the embedded cover/branding pictures whose alt-text marks them.
+
+        In the source template these spots are real pictures whose placeholder
+        (e.g. {{main_img}}) lives in the picture's alt-text description
+        (wp:docPr/pic:cNvPr @descr), not as body text. We locate each drawing by
+        that description, replace the underlying image bytes with our generated
+        image (preserving the template's size/layout), and clear the placeholder
+        from the alt-text so no {{...}} remains anywhere.
+
+        image_map: { '{{placeholder}}': (image_path_or_None, width_inches) }
+        width is ignored here; the template's existing extent is kept.
+        """
+        from docx.oxml.ns import qn
+
+        descr_tags = (qn("wp:docPr"), qn("pic:cNvPr"))
+        blip_tag = qn("a:blip")
+        embed_attr = qn("r:embed")
+
+        for drawing in doc.element.body.iter(qn("w:drawing")):
+            descr_nodes = [el for tag in descr_tags for el in drawing.iter(tag)]
+            matched = None
+            for el in descr_nodes:
+                descr = el.get("descr") or ""
+                for placeholder in image_map:
+                    if placeholder in descr:
+                        matched = placeholder
+                        break
+                if matched:
+                    break
+            if not matched:
+                continue
+
+            image_path, _width = image_map[matched]
+            if image_path and os.path.exists(image_path):
+                rid = None
+                for blip in drawing.iter(blip_tag):
+                    rid = blip.get(embed_attr)
+                    if rid:
+                        break
+                part = doc.part.related_parts.get(rid) if rid else None
+                if part is not None:
+                    try:
+                        with open(image_path, "rb") as fh:
+                            part._blob = fh.read()
+                        logger.info(f"Swapped template image {matched} -> {image_path}")
+                    except Exception as exc:
+                        logger.error(f"Image swap failed for {matched}: {exc}")
+                else:
+                    logger.warning(f"No image relationship found for {matched}")
+            else:
+                logger.warning(f"Image not available for {matched}: {image_path}")
+
+            # Clear the placeholder from alt-text so no {{...}} survives
+            for el in descr_nodes:
+                descr = el.get("descr") or ""
+                for placeholder in image_map:
+                    descr = descr.replace(placeholder, "")
+                el.set("descr", descr)
 
     def _replace_image_placeholder(self, doc: Document, placeholder: str, image_path: Optional[str], width_inches: float = 3.0):
         """
@@ -766,6 +1302,16 @@ Industrial Space Trends Impact {property_type} Demand:
         """
         if not image_path or not os.path.exists(image_path):
             logger.warning(f"Image not found for placeholder {placeholder}: {image_path}")
+            # Clear the raw placeholder text so it doesn't show in the output
+            for paragraph in doc.paragraphs:
+                if placeholder in paragraph.text:
+                    paragraph.text = paragraph.text.replace(placeholder, "")
+            for table in doc.tables:
+                for row in table.rows:
+                    for cell in row.cells:
+                        for paragraph in cell.paragraphs:
+                            if placeholder in paragraph.text:
+                                paragraph.text = paragraph.text.replace(placeholder, "")
             return
             
         # Search and replace in paragraphs
@@ -842,7 +1388,7 @@ Industrial Space Trends Impact {property_type} Demand:
         doc.add_heading('6. Data Sources & Disclaimer', level=2)
         doc.add_paragraph(property_data.market_data_sources)
 
-    def create_word_document(self, property_data: PropertyReportData) -> str:
+    def create_word_document(self, property_data: PropertyReportData, color_theme: Optional[str] = None) -> str:
         """
         Create Word document from property data using template
         """
@@ -850,6 +1396,12 @@ Industrial Space Trends Impact {property_type} Demand:
         
         # Load template
         doc = Document(self.template_path)
+
+        # Property-detail fields should always show a value so the report stays
+        # consistent with the prior template (blank inputs -> "N/A").
+        def na(value):
+            text = str(value).strip() if value is not None else ""
+            return text if text else "N/A"
         
         # Define all replacements
         replacements = {
@@ -867,16 +1419,16 @@ Industrial Space Trends Impact {property_type} Demand:
             '{{county}}': property_data.county,
             '{{longitude}}': property_data.longitude,
             '{{latitude}}': property_data.latitude,
-            '{{Topography}}': property_data.topography,
-            '{{shape}}': property_data.shape,
-            '{{Access}}': property_data.access,
-            '{{Exposure}}': property_data.exposure,
-            '{{lot_area}}': property_data.lot_area,
-            '{{acres}}': property_data.acres,
-            '{{recorded_sale_date}}': property_data.recorded_sale_date,
-            '{{zoning}}': property_data.zoning,
-            '{{apn}}': property_data.apn,
-            '{{current_owner}}': property_data.current_owner,
+            '{{Topography}}': na(property_data.topography),
+            '{{shape}}': na(property_data.shape),
+            '{{Access}}': na(property_data.access),
+            '{{Exposure}}': na(property_data.exposure),
+            '{{lot_area}}': na(property_data.lot_area),
+            '{{acres}}': na(property_data.acres),
+            '{{recorded_sale_date}}': na(property_data.recorded_sale_date),
+            '{{zoning}}': na(property_data.zoning),
+            '{{apn}}': na(property_data.apn),
+            '{{current_owner}}': na(property_data.current_owner),
             '{{marketing_period}}': property_data.marketing_period,
             '{{swot_strengths}}': property_data.swot_strengths,
             '{{swot_weaknesses}}': property_data.swot_weaknesses,
@@ -901,13 +1453,39 @@ Industrial Space Trends Impact {property_type} Demand:
             '{{market_data_sources}}': property_data.market_data_sources,
             '{{market_quarter}}': property_data.market_quarter,
         }
+
+        # Merge BOV table values (population, households, rings, employment, valuation)
+        if property_data.table_values:
+            replacements.update(property_data.table_values)
         
         # Replace text in all document elements
         self._replace_text_in_document(doc, replacements)
-        
-        # Replace image placeholders
-        self._replace_image_placeholder(doc, '{{ariel_image}}', property_data.aerial_image_path, width_inches=4.0)
-        self._replace_image_placeholder(doc, '{{street_view}}', property_data.street_view_image_path, width_inches=4.0)
+
+        # Replace placeholders inside text boxes (cover, side bars) and headers/footers
+        self._replace_in_textboxes(doc, replacements)
+
+        # Cover/branding images live inside text boxes; subject photo falls back to aerial
+        subject_image = property_data.street_view_image_path or property_data.aerial_image_path
+        self._replace_textbox_images(doc, {
+            '{{main_img}}': (property_data.aerial_image_path, 6.0),
+            '{{aerial_image}}': (property_data.aerial_image_path, 6.0),
+            '{{Subject_photo}}': (subject_image, 3.5),
+            '{{subject_photo}}': (subject_image, 3.5),
+        })
+
+        # Replace image placeholders in regular paragraphs/cells (legacy + BOV names)
+        for ph in ('{{ariel_image}}', '{{aerial_map}}'):
+            self._replace_image_placeholder(doc, ph, property_data.aerial_image_path, width_inches=6.0)
+        for ph in ('{{street_view}}', '{{subject_photos}}'):
+            self._replace_image_placeholder(doc, ph, property_data.street_view_image_path, width_inches=4.0)
+
+        # Insert comparable sales from uploaded PDF (fills the comps section; avoids blank page)
+        if property_data.comps:
+            self._insert_comparables(doc, property_data.comps)
+
+        # Refresh employment table with recent-year data (not static 2010-2019 sample)
+        if property_data.bov_dataset:
+            self._fill_employment_table(doc, property_data.bov_dataset, property_data.county, property_data.state)
         
         # Remove the programmatic market analysis section since we're using placeholders
         # self._create_market_analysis_section(doc, property_data)
@@ -920,8 +1498,55 @@ Industrial Space Trends Impact {property_type} Demand:
         # Save document
         doc.save(output_path)
         logger.info(f"Document saved: {output_path}")
+
+        # Apply color theme to the report accent (post-process the saved file)
+        if color_theme:
+            self._apply_color_theme(output_path, color_theme)
         
         return str(output_path)
+
+    # Template accent colors -> theme replacements (primary, secondary)
+    COLOR_THEMES = {
+        "light blue": ("0070C0", "00B0F0"),
+        "dark blue": ("1F3864", "2E5496"),
+        "red": ("C00000", "FF3B3B"),
+        "green": ("2E7D32", "5BB85C"),
+    }
+    TEMPLATE_ACCENTS = ("0070C0", "00B0F0")
+
+    def _apply_color_theme(self, output_path, color_theme: str):
+        """Recolor the report accent by swapping the template's blue hex codes."""
+        theme = (color_theme or "").strip().lower()
+        target = self.COLOR_THEMES.get(theme)
+        if not target or theme == "light blue":
+            return  # default/unknown -> leave template's blue
+
+        import zipfile
+        import shutil
+        import tempfile
+
+        src_primary, src_secondary = self.TEMPLATE_ACCENTS
+        dst_primary, dst_secondary = target
+
+        def recolor(text: str) -> str:
+            for src, dst in ((src_primary, dst_primary), (src_secondary, dst_secondary)):
+                text = text.replace(f'"{src}"', f'"{dst}"')
+                text = text.replace(f'"{src.lower()}"', f'"{dst}"')
+            return text
+
+        try:
+            tmp_fd, tmp_path = tempfile.mkstemp(suffix=".docx")
+            os.close(tmp_fd)
+            with zipfile.ZipFile(output_path, "r") as zin, zipfile.ZipFile(tmp_path, "w", zipfile.ZIP_DEFLATED) as zout:
+                for item in zin.namelist():
+                    data = zin.read(item)
+                    if item.startswith("word/") and item.endswith(".xml"):
+                        data = recolor(data.decode("utf-8", "ignore")).encode("utf-8")
+                    zout.writestr(item, data)
+            shutil.move(tmp_path, output_path)
+            logger.info(f"Applied '{theme}' color theme to {output_path}")
+        except Exception as exc:
+            logger.error(f"Failed to apply color theme '{theme}': {exc}")
 
     def _replace_text_in_runs(self, paragraph, placeholder: str, replacement: str):
         """Replace text while preserving the formatting of runs"""
@@ -1032,12 +1657,12 @@ Industrial Space Trends Impact {property_type} Demand:
                         if placeholder in paragraph.text:
                             self._replace_text_in_runs(paragraph, placeholder, replacement)
 
-    def process_single_property(self, address: str, **kwargs) -> str:
+    def process_single_property(self, address: str, color_theme: Optional[str] = None, **kwargs) -> str:
         """
         Complete workflow for single property
         """
         property_data = self.create_property_report(address, **kwargs)
-        document_path = self.create_word_document(property_data)
+        document_path = self.create_word_document(property_data, color_theme=color_theme)
         return document_path
 
     def process_csv_batch(self, csv_path: str) -> List[str]:
@@ -1074,16 +1699,18 @@ def main():
     """
     Example usage with market analysis
     """
-    from config import get_openai_api_key, get_google_api_key
+    from config import get_openai_api_key, get_google_api_key, get_esri_api_key
     OPENAI_API_KEY = get_openai_api_key()
     GOOGLE_API_KEY = get_google_api_key()
+    ESRI_API_KEY = get_esri_api_key()
     TEMPLATE_PATH = "template.docx"
     
     # Initialize generator
     generator = ComprehensivePropertyReportGenerator(
         openai_api_key=OPENAI_API_KEY,
-        google_api_key=GOOGLE_API_KEY,
         template_path=TEMPLATE_PATH,
+        google_api_key=GOOGLE_API_KEY,
+        esri_api_key=ESRI_API_KEY,
         output_dir="property_reports"
     )
     
