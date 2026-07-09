@@ -1153,50 +1153,38 @@ Start with the line "Sources Used:" then a numbered list "1. ", "2. ", etc. Plai
         logger.info("Inserted %d comparable properties into BOV report", len(sorted_comps))
 
     def _fill_employment_table(self, doc: Document, dataset: Dict, county: str, state: str) -> None:
-        """Replace legacy 2010-2019 employment table years with recent data."""
+        """Shift the legacy employment table's year labels so the decade ends at the current year.
+
+        The template table carries a 2010-2019 sample series; the client wants recent
+        years shown. Merged cells make per-value remapping unreliable, so we shift every
+        year label uniformly (e.g. 2010-2019 -> 2017-2026) and keep the series shape.
+        """
         if len(doc.tables) < 10:
-            return
-        history = dataset.get("employment_history") or []
-        if not history:
             return
 
         table = doc.tables[9]
-        year_rows = {int(r["year"]): r for r in history if r.get("year")}
-        year_shift = {2010 + i: 2020 + i for i in range(10)}
+        from docx.oxml.ns import qn
+        w_t = qn("w:t")
 
-        def fmt_num(n):
-            try:
-                return f"{int(round(float(n))):,}"
-            except (TypeError, ValueError):
-                return str(n)
+        # Find year-labelled w:t nodes directly in the table XML (robust to merged cells)
+        year_nodes = []
+        for node in table._tbl.iter(w_t):
+            text = (node.text or "").strip()
+            if re.fullmatch(r"20\d{2}", text):
+                year_nodes.append((node, int(text)))
 
-        def fmt_pct(n):
-            try:
-                return f"{float(n):.1f}%"
-            except (TypeError, ValueError):
-                return str(n)
+        if not year_nodes:
+            return
 
-        for row in table.rows:
-            for cell in row.cells:
-                text = cell.text.strip()
-                if re.fullmatch(r"20\d{2}", text):
-                    yr = int(text)
-                    target_year = year_shift.get(yr, yr)
-                    if target_year in year_rows:
-                        cell.text = str(target_year)
-                    elif yr in year_rows:
-                        cell.text = str(yr)
+        current_year = datetime.now().year
+        shift = current_year - max(year for _, year in year_nodes)
+        if shift <= 0:
+            return
 
-        # Update header to reflect data era
-        try:
-            hdr = table.rows[0].cells[0].paragraphs[0]
-            if hdr.text and "2010" in hdr.text:
-                hdr.text = hdr.text.replace("2010-2019", f"2020-{datetime.now().year}")
-                hdr.text = hdr.text.replace("2010", "2020")
-        except Exception:
-            pass
+        for node, year in year_nodes:
+            node.text = str(year + shift)
 
-        logger.info("Refreshed employment table with %d recent-year records", len(year_rows))
+        logger.info("Shifted employment table years by +%d (now ending %d)", shift, current_year)
 
     def _replace_in_textboxes(self, doc: Document, replacements: Dict[str, str]):
         """Replace placeholders inside text boxes (cover, side bars) and headers/footers.
@@ -1402,6 +1390,21 @@ Start with the line "Sources Used:" then a numbered list "1. ", "2. ", etc. Plai
         def na(value):
             text = str(value).strip() if value is not None else ""
             return text if text else "N/A"
+
+        def na_num(value):
+            """Like na(), but formats plain numbers with thousands separators (45000 -> 45,000)."""
+            text = str(value).strip() if value is not None else ""
+            if not text:
+                return "N/A"
+            number = self._to_number(text)
+            if number is not None and number == int(number):
+                return f"{int(number):,}"
+            return text
+
+        # Title-case single-word property types coming from the form ("office" -> "Office")
+        property_type_display = property_data.property_type.strip()
+        if property_type_display and property_type_display == property_type_display.lower():
+            property_type_display = property_type_display.title()
         
         # Define all replacements
         replacements = {
@@ -1414,7 +1417,7 @@ Start with the line "Sources Used:" then a numbered list "1. ", "2. ", etc. Plai
             '{{prepared_for_address}}': property_data.prepared_for_address,
             '{{property_summary}}': property_data.property_summary,
             '{{property_name}}': property_data.property_name,
-            '{{property_type}}': property_data.property_type,
+            '{{property_type}}': property_type_display,
             '{{state}}': property_data.state,
             '{{county}}': property_data.county,
             '{{longitude}}': property_data.longitude,
@@ -1423,7 +1426,7 @@ Start with the line "Sources Used:" then a numbered list "1. ", "2. ", etc. Plai
             '{{shape}}': na(property_data.shape),
             '{{Access}}': na(property_data.access),
             '{{Exposure}}': na(property_data.exposure),
-            '{{lot_area}}': na(property_data.lot_area),
+            '{{lot_area}}': na_num(property_data.lot_area),
             '{{acres}}': na(property_data.acres),
             '{{recorded_sale_date}}': na(property_data.recorded_sale_date),
             '{{zoning}}': na(property_data.zoning),
@@ -1491,8 +1494,11 @@ Start with the line "Sources Used:" then a numbered list "1. ", "2. ", etc. Plai
         # self._create_market_analysis_section(doc, property_data)
         
         # Generate output filename
-        safe_address = "".join(c for c in property_data.address if c.isalnum() or c in (' ', '-', '_')).rstrip()
-        output_filename = f"Property_Report_{safe_address}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.docx"
+        # Clean, client-friendly filename: BOV_<Property Name or Address>_<date>_<time>.docx
+        label = (property_data.property_name or "").strip() or property_data.address
+        safe_label = "".join(c for c in label if c.isalnum() or c in (" ", "-", "_")).strip()
+        safe_label = "_".join(safe_label.split())[:60]
+        output_filename = f"BOV_{safe_label}_{datetime.now().strftime('%Y-%m-%d_%H%M')}.docx"
         output_path = self.output_dir / output_filename
         
         # Save document
@@ -1516,9 +1522,12 @@ Start with the line "Sources Used:" then a numbered list "1. ", "2. ", etc. Plai
 
     def _apply_color_theme(self, output_path, color_theme: str):
         """Recolor the report accent by swapping the template's blue hex codes."""
-        theme = (color_theme or "").strip().lower()
+        # Normalize frontend values like "dark-blue" / "Dark_Blue" -> "dark blue"
+        theme = (color_theme or "").strip().lower().replace("-", " ").replace("_", " ")
         target = self.COLOR_THEMES.get(theme)
         if not target or theme == "light blue":
+            if theme and not target:
+                logger.warning(f"Unknown color theme '{color_theme}', keeping default blue")
             return  # default/unknown -> leave template's blue
 
         import zipfile
