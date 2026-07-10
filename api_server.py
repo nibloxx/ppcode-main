@@ -1,5 +1,6 @@
 from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
+from werkzeug.utils import secure_filename
 import os
 import tempfile
 import shutil
@@ -20,7 +21,18 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
-CORS(app)  # Enable CORS for all routes
+
+# Restrict CORS to known frontends (comma-separated ALLOWED_ORIGINS env var to extend)
+_default_origins = "http://localhost:3000,http://127.0.0.1:3000,https://vascre-dev.vercel.app"
+ALLOWED_ORIGINS = [
+    origin.strip()
+    for origin in os.environ.get("ALLOWED_ORIGINS", _default_origins).split(",")
+    if origin.strip()
+]
+CORS(app, origins=ALLOWED_ORIGINS)
+
+# Cap uploads at 25 MB so oversized files can't exhaust memory/disk
+app.config["MAX_CONTENT_LENGTH"] = 25 * 1024 * 1024
 
 # Configuration
 # Prefer the richer BOV template when present; fall back to the legacy template.
@@ -56,7 +68,10 @@ def resolve_template(data: dict) -> str:
     if not requested:
         return TEMPLATE_PATH
 
-    path = TEMPLATE_CHOICES.get(requested.lower(), requested)
+    # Only allow whitelisted template names; never treat client input as a path
+    path = TEMPLATE_CHOICES.get(str(requested).strip().lower())
+    if not path:
+        return TEMPLATE_PATH
     return path if Path(path).exists() else TEMPLATE_PATH
 
 # Initialize generators
@@ -92,6 +107,33 @@ def initialize_generators():
 
 # Initialize generators when module is imported
 initialize_generators()
+
+REPORTS_DIR = Path("property_reports").resolve()
+
+
+def safe_report_path(filename: str) -> Path | None:
+    """Resolve a user-supplied filename inside property_reports, rejecting traversal.
+
+    Returns the resolved path, or None if the name escapes the reports directory
+    or is not a .docx report.
+    """
+    name = (filename or "").strip()
+    # Reject path separators, parent references, drive letters, null bytes
+    if (
+        not name
+        or not name.lower().endswith(".docx")
+        or "/" in name
+        or "\\" in name
+        or ".." in name
+        or ":" in name
+        or "\x00" in name
+    ):
+        return None
+    candidate = (REPORTS_DIR / name).resolve()
+    if candidate.parent != REPORTS_DIR:
+        return None
+    return candidate
+
 
 def download_pdf_from_url(url: str, temp_dir: Path) -> Path:
     """Download PDF from URL and return local file path"""
@@ -245,8 +287,10 @@ def generate_property_report():
         if comp_file and comp_file.filename:
             if not comp_extractor:
                 return jsonify({'error': 'Comp extractor not initialized'}), 500
+            if not comp_file.filename.lower().endswith('.pdf'):
+                return jsonify({'error': 'Comps file must be a PDF'}), 400
             with tempfile.TemporaryDirectory() as temp_dir:
-                pdf_path = Path(temp_dir) / comp_file.filename
+                pdf_path = Path(temp_dir) / (secure_filename(comp_file.filename) or 'comps.pdf')
                 comp_file.save(str(pdf_path))
                 logger.info(f"Extracting comps from uploaded PDF: {pdf_path}")
                 comps = comp_extractor.extract_comps_from_pdf(str(pdf_path))
@@ -298,6 +342,8 @@ def generate_property_report():
     except Exception as e:
         logger.error(f"Error generating property report: {e}")
         logger.error(traceback.format_exc())
+        # str(e) is surfaced to help the user fix input/config issues (e.g. bad address,
+        # missing API key); full tracebacks stay server-side in the logs.
         return jsonify({
             'error': f'Failed to generate property report: {str(e)}'
         }), 500
@@ -306,24 +352,24 @@ def generate_property_report():
 def generate_report_alias():
     return generate_property_report()
     
-@app.route('/download_property_report/<filename>', methods=['GET'])
+@app.route('/download_property_report/<path:filename>', methods=['GET'])
 def download_property_report(filename):
     """Download a generated property report"""
     try:
-        file_path = Path("property_reports") / filename
-        if not file_path.exists():
+        file_path = safe_report_path(filename)
+        if file_path is None or not file_path.exists():
             return jsonify({'error': 'File not found'}), 404
         
         return send_file(
             file_path,
             as_attachment=True,
-            download_name=filename,
+            download_name=file_path.name,
             mimetype='application/vnd.openxmlformats-officedocument.wordprocessingml.document'
         )
         
     except Exception as e:
         logger.error(f"Error downloading file: {e}")
-        return jsonify({'error': f'Failed to download file: {str(e)}'}), 500
+        return jsonify({'error': 'Failed to download file'}), 500
 
 @app.route('/process_comps', methods=['POST'])
 def process_comps():
@@ -503,24 +549,24 @@ def process_comps():
             'error': f'Failed to process comps: {str(e)}'
         }), 500
 
-@app.route('/download_comp_report/<filename>', methods=['GET'])
+@app.route('/download_comp_report/<path:filename>', methods=['GET'])
 def download_comp_report(filename):
     """Download a generated comp report"""
     try:
-        file_path = Path("property_reports") / filename
-        if not file_path.exists():
+        file_path = safe_report_path(filename)
+        if file_path is None or not file_path.exists():
             return jsonify({'error': 'File not found'}), 404
         
         return send_file(
             file_path,
             as_attachment=True,
-            download_name=filename,
+            download_name=file_path.name,
             mimetype='application/vnd.openxmlformats-officedocument.wordprocessingml.document'
         )
         
     except Exception as e:
         logger.error(f"Error downloading file: {e}")
-        return jsonify({'error': f'Failed to download file: {str(e)}'}), 500
+        return jsonify({'error': 'Failed to download file'}), 500
 
 @app.route('/generate_combined_report', methods=['POST'])
 def generate_combined_report():
@@ -570,14 +616,15 @@ def generate_combined_report():
                 pdf_path = data['pdf_path']
                 temp_dir = None
                 
-                # Check if pdf_path is a URL
-                if pdf_path.startswith(('http://', 'https://')):
-                    temp_dir = Path(tempfile.mkdtemp())
-                    pdf_path = download_pdf_from_url(pdf_path, temp_dir)
+                # Only accept URLs; never read arbitrary local paths from client input
+                if not str(pdf_path).startswith(('http://', 'https://')):
+                    return jsonify({'error': 'pdf_path must be an http(s) URL'}), 400
+                temp_dir = Path(tempfile.mkdtemp())
+                pdf_path = download_pdf_from_url(pdf_path, temp_dir)
                 
                 comps = comp_extractor.extract_comps_from_pdf(str(pdf_path))
-                template_path = data.get('template_path', COMP_TEMPLATE_PATH)
-                output_path = comp_extractor.replace_keywords_in_document(template_path, comps)
+                # Template is server-controlled; ignore client-supplied paths
+                output_path = comp_extractor.replace_keywords_in_document(COMP_TEMPLATE_PATH, comps)
                 
                 # Clean up temporary files
                 if temp_dir and temp_dir.exists():
@@ -641,24 +688,24 @@ def list_reports():
         logger.error(f"Error listing reports: {e}")
         return jsonify({'error': f'Failed to list reports: {str(e)}'}), 500
 
-@app.route('/delete_report/<filename>', methods=['DELETE'])
+@app.route('/delete_report/<path:filename>', methods=['DELETE'])
 def delete_report(filename):
     """Delete a specific report"""
     try:
-        file_path = Path("property_reports") / filename
-        if not file_path.exists():
+        file_path = safe_report_path(filename)
+        if file_path is None or not file_path.exists():
             return jsonify({'error': 'File not found'}), 404
         
         file_path.unlink()
         
         return jsonify({
             'success': True,
-            'message': f'Report {filename} deleted successfully'
+            'message': f'Report {file_path.name} deleted successfully'
         })
         
     except Exception as e:
         logger.error(f"Error deleting file: {e}")
-        return jsonify({'error': f'Failed to delete file: {str(e)}'}), 500
+        return jsonify({'error': 'Failed to delete file'}), 500
 
 if __name__ == '__main__':
     # Initialize generators on startup
