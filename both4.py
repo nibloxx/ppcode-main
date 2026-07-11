@@ -332,27 +332,24 @@ Plain text only. No markdown, no bullet points, no headings."""
         return self._get_ai_response(prompt)
 
     def _generate_vacancy_rates(self, context: str, property_type: str, market_data: Dict) -> str:
-        """Generate vacancy rates section with formatted data"""
-        
-        # Generate clean text without any formatting markers
-        vacancy_section = f"""-   Direct Vacancy: {market_data.get('direct_vacancy', 12.71)}% ({market_data.get('direct_qoq', '+1.02')}% QoQ, {market_data.get('direct_yoy', '+1.68')}% YoY)
-
--   Sublease Vacancy: {market_data.get('sublease_vacancy', 5.51)}% ({market_data.get('sublease_qoq', '-0.39')}% QoQ)
-
--   Total Vacancy: {market_data.get('total_vacancy', 18.22)}%"""
-        
-        return vacancy_section
+        """Generate vacancy rates as one bullet per line (no blank lines — those break justified layout)."""
+        return (
+            f"-   Direct Vacancy: {market_data.get('direct_vacancy', 12.71)}% "
+            f"({market_data.get('direct_qoq', '+1.02')}% QoQ, {market_data.get('direct_yoy', '+1.68')}% YoY)\n"
+            f"-   Sublease Vacancy: {market_data.get('sublease_vacancy', 5.51)}% "
+            f"({market_data.get('sublease_qoq', '-0.39')}% QoQ)\n"
+            f"-   Total Vacancy: {market_data.get('total_vacancy', 18.22)}%"
+        )
 
     def _generate_lease_rates(self, context: str, property_type: str, market_data: Dict) -> str:
-        """Generate lease rates section (data-driven, market-specific numbers)."""
-        lease_section = f"""-   Overall Average: ${market_data.get('avg_lease_rate', 'n/a')}/SF (${market_data.get('lease_rate_yoy', 'n/a')} YoY)
-
--   Class A: ${market_data.get('class_a_rate', 'n/a')}/SF
-
--   Class B: ${market_data.get('class_b_rate', 'n/a')}/SF
-
--   Class C: ${market_data.get('class_c_rate', 'n/a')}/SF"""
-        return lease_section
+        """Generate lease rates as one bullet per line (no blank lines)."""
+        return (
+            f"-   Overall Average: ${market_data.get('avg_lease_rate', 'n/a')}/SF "
+            f"({market_data.get('lease_rate_yoy', 'n/a')} YoY)\n"
+            f"-   Class A: ${market_data.get('class_a_rate', 'n/a')}/SF\n"
+            f"-   Class B: ${market_data.get('class_b_rate', 'n/a')}/SF\n"
+            f"-   Class C: ${market_data.get('class_c_rate', 'n/a')}/SF"
+        )
 
     def _generate_construction_activity(self, context: str, property_type: str, market_data: Dict) -> str:
         """Generate a location-specific construction activity section via AI."""
@@ -369,7 +366,8 @@ Use these figures: approximately {int(construction_sf):,} SF under construction,
 Reference realistic, plausible recent deliveries and pipeline trends specific to {county}, {state}.
 Do NOT reference any other market (no Salt Lake, Lehi, Provo, etc. unless that is the actual county/state).
 
-Return 2-3 concise bullet points, each starting with "-   ". Plain text only."""
+        Return 2-3 concise bullet points, each starting with "-   ", with NO blank lines between bullets.
+Plain text only. No markdown."""
         return self._get_ai_response(prompt)
 
     def _generate_market_trends(self, context: str, property_type: str, market_data: Dict) -> str:
@@ -540,12 +538,12 @@ Start with the line "Sources Used:" then a numbered list "1. ", "2. ", etc. Plai
             f"Summarize location, key value drivers, and the value conclusion. Plain text only.",
         )
         property_data.regional_analysis = self._get_ai_response(
-            f"Write a detailed 2-paragraph regional analysis for the area around the subject property, "
-            f"grounded specifically in {property_data.county}, {property_data.state}. "
-            f"Cover: population size and growth trend, household composition and income levels, key employers "
-            f"and industries, transportation/accessibility, and how these support demand for "
-            f"{property_data.property_type} space. Use recent ({datetime.now().year}) framing and consistent "
-            f"structure. Do not reference any other market. Context:\n{context}\nPlain text only.",
+            f"Write ONE concise paragraph (4-6 sentences) of regional analysis for the area around "
+            f"the subject property in {property_data.county}, {property_data.state}. "
+            f"Cover population/growth, households/income, and how that supports demand for "
+            f"{property_data.property_type} space. Use recent ({datetime.now().year}) framing. "
+            f"Do not reference any other market. Context:\n{context}\n"
+            f"Plain text only. Single paragraph — no blank lines, no markdown.",
         )
         property_data.sales_conclusion = self._get_ai_response(
             f"Write a 1-paragraph sales conclusion for a {property_data.property_type} BOV that ties "
@@ -1218,6 +1216,39 @@ Start with the line "Sources Used:" then a numbered list "1. ", "2. ", etc. Plai
                 except Exception:
                     pass
 
+    def _blob_matching_part(self, image_path: str, part) -> bytes:
+        """Return image bytes compatible with the template media part's format.
+
+        Google Static Maps often returns PNG; Word cover slots are usually .jpg.
+        Writing PNG bytes into a JPEG part shows as a broken-image icon.
+        """
+        with open(image_path, "rb") as fh:
+            data = fh.read()
+
+        part_name = str(getattr(part, "partname", "") or "").lower()
+        wants_jpeg = part_name.endswith((".jpg", ".jpeg"))
+        wants_png = part_name.endswith(".png")
+        is_png = data[:8] == b"\x89PNG\r\n\x1a\n"
+        is_jpeg = data[:3] == b"\xff\xd8\xff"
+
+        if wants_jpeg and is_png:
+            from io import BytesIO
+            from PIL import Image
+
+            img = Image.open(BytesIO(data)).convert("RGB")
+            buf = BytesIO()
+            img.save(buf, format="JPEG", quality=90)
+            return buf.getvalue()
+        if wants_png and is_jpeg:
+            from io import BytesIO
+            from PIL import Image
+
+            img = Image.open(BytesIO(data))
+            buf = BytesIO()
+            img.save(buf, format="PNG")
+            return buf.getvalue()
+        return data
+
     def _replace_textbox_images(self, doc: Document, image_map: Dict[str, tuple]):
         """Swap the embedded cover/branding pictures whose alt-text marks them.
 
@@ -1261,8 +1292,7 @@ Start with the line "Sources Used:" then a numbered list "1. ", "2. ", etc. Plai
                 part = doc.part.related_parts.get(rid) if rid else None
                 if part is not None:
                     try:
-                        with open(image_path, "rb") as fh:
-                            part._blob = fh.read()
+                        part._blob = self._blob_matching_part(image_path, part)
                         logger.info(f"Swapped template image {matched} -> {image_path}")
                     except Exception as exc:
                         logger.error(f"Image swap failed for {matched}: {exc}")
@@ -1467,13 +1497,12 @@ Start with the line "Sources Used:" then a numbered list "1. ", "2. ", etc. Plai
         # Replace placeholders inside text boxes (cover, side bars) and headers/footers
         self._replace_in_textboxes(doc, replacements)
 
-        # Cover/branding images live inside text boxes; subject photo falls back to aerial
-        subject_image = property_data.street_view_image_path or property_data.aerial_image_path
+        # Cover aerial images; subject photo must be Street View only (never reuse aerial)
         self._replace_textbox_images(doc, {
             '{{main_img}}': (property_data.aerial_image_path, 6.0),
             '{{aerial_image}}': (property_data.aerial_image_path, 6.0),
-            '{{Subject_photo}}': (subject_image, 3.5),
-            '{{subject_photo}}': (subject_image, 3.5),
+            '{{Subject_photo}}': (property_data.street_view_image_path, 3.5),
+            '{{subject_photo}}': (property_data.street_view_image_path, 3.5),
         })
 
         # Replace image placeholders in regular paragraphs/cells (legacy + BOV names)
@@ -1481,6 +1510,12 @@ Start with the line "Sources Used:" then a numbered list "1. ", "2. ", etc. Plai
             self._replace_image_placeholder(doc, ph, property_data.aerial_image_path, width_inches=6.0)
         for ph in ('{{street_view}}', '{{subject_photos}}'):
             self._replace_image_placeholder(doc, ph, property_data.street_view_image_path, width_inches=4.0)
+
+        # Normalize long AI body text so it doesn't inherit decorative blue/italic placeholder styling
+        self._normalize_filled_body_styles(doc)
+
+        # Collapse leftover empty paragraphs that create large white gaps
+        self._collapse_empty_spacing(doc)
 
         # Insert comparable sales from uploaded PDF (fills the comps section; avoids blank page)
         if property_data.comps:
@@ -1558,80 +1593,134 @@ Start with the line "Sources Used:" then a numbered list "1. ", "2. ", etc. Plai
             logger.error(f"Failed to apply color theme '{theme}': {exc}")
 
     def _replace_text_in_runs(self, paragraph, placeholder: str, replacement: str):
-        """Replace text while preserving the formatting of runs"""
-        if placeholder in paragraph.text:
-            # Handle em dash replacement
-            replacement = replacement.replace('--', '–')
-            
-            # Work with runs to preserve formatting
+        """Replace placeholder text while preserving run formatting.
+
+        Multi-line replacements (vacancy/lease bullets, etc.) are split into
+        separate sibling paragraphs so Word justify does not stretch gaps across
+        blank lines inside a single paragraph.
+        """
+        if placeholder not in paragraph.text:
+            return
+
+        replacement = (replacement or "").replace("--", "–").replace("\r\n", "\n").replace("\r", "\n")
+        # Strip markdown bold markers AI sometimes adds
+        replacement = re.sub(r"\*\*([^*]+)\*\*", r"\1", replacement)
+        lines = [ln for ln in replacement.split("\n") if ln.strip() != ""] if "\n" in replacement else [replacement]
+        first_line = lines[0] if lines else ""
+
+        # Prefer in-run replace when the whole placeholder lives in one run
+        for run in paragraph.runs:
+            if placeholder in run.text:
+                run.text = run.text.replace(placeholder, first_line)
+                self._style_as_body_run(run)
+                break
+        else:
+            # Placeholder spans runs — rebuild the paragraph text once
+            full_text = paragraph.text.replace(placeholder, first_line)
+            formatting_run = paragraph.runs[0] if paragraph.runs else None
+            paragraph.clear()
+            new_run = paragraph.add_run(full_text)
+            if formatting_run is not None:
+                new_run.bold = formatting_run.bold
+                new_run.italic = formatting_run.italic
+                if formatting_run.font.size:
+                    new_run.font.size = formatting_run.font.size
+                if formatting_run.font.name:
+                    new_run.font.name = formatting_run.font.name
+            self._style_as_body_run(new_run)
+
+        # Extra lines become their own paragraphs (matches original template layout)
+        if len(lines) > 1:
+            anchor = paragraph
+            for line in lines[1:]:
+                new_p = self._insert_paragraph_after(anchor)
+                new_p.alignment = paragraph.alignment
+                # Copy paragraph style if present
+                try:
+                    new_p.style = paragraph.style
+                except Exception:
+                    pass
+                run = new_p.add_run(line)
+                if paragraph.runs:
+                    src = paragraph.runs[0]
+                    run.bold = src.bold
+                    run.italic = src.italic
+                    if src.font.size:
+                        run.font.size = src.font.size
+                    if src.font.name:
+                        run.font.name = src.font.name
+                self._style_as_body_run(run)
+                anchor = new_p
+
+    @staticmethod
+    def _style_as_body_run(run) -> None:
+        """Force filled body text to normal black (avoid inheriting blue/italic placeholder style)."""
+        try:
+            run.italic = False
+            run.font.color.rgb = RGBColor(0, 0, 0)
+        except Exception:
+            pass
+
+    def _normalize_filled_body_styles(self, doc: Document) -> None:
+        """After fill, force long narrative body paragraphs to black non-italic body text.
+
+        Placeholders for executive/regional summaries sit in decorative blue-italic
+        sample paragraphs from the original BOV. Leaving that style on long AI text
+        makes reports look completely different from the short-sample Coppell layout.
+        """
+        # Heading-like all-caps short labels should keep their styling
+        skip_prefixes = (
+            "EXECUTIVE SUMMARY", "REGIONAL ANALYSIS", "DEMOGRAPHIC", "PROPERTY SUMMARY",
+            "LOCATION SUMMARY", "AERIAL MAP", "SUBJECT PHOTOS", "EMPLOYMENT",
+            "SALES CONCLUSION", "CERTIFICATION", "RECONCILIATION", "GENERAL INFORMATION",
+            "PROPERTY COMPARABLES", "Comparable ",
+        )
+        for paragraph in doc.paragraphs:
+            text = paragraph.text.strip()
+            if len(text) < 80:
+                continue
+            if any(text.startswith(p) for p in skip_prefixes):
+                continue
             for run in paragraph.runs:
-                if placeholder in run.text:
-                    # Replace the placeholder while keeping the run's formatting
-                    run.text = run.text.replace(placeholder, replacement)
-                    return
-            
-            # If placeholder spans multiple runs, we need a more complex approach
-            full_text = paragraph.text
-            if placeholder in full_text:
-                # Store the formatting of each character
-                char_formats = []
-                char_index = 0
-                
-                for run in paragraph.runs:
-                    for char in run.text:
-                        char_formats.append({
-                            'bold': run.bold,
-                            'italic': run.italic,
-                            'underline': run.underline,
-                            'font_name': run.font.name,
-                            'font_size': run.font.size,
-                            'run': run
-                        })
-                        char_index += 1
-                
-                # Find where the placeholder starts
-                placeholder_start = full_text.find(placeholder)
-                if placeholder_start != -1:
-                    # Clear the paragraph
-                    paragraph.clear()
-                    
-                    # Add the text before placeholder
-                    if placeholder_start > 0:
-                        run = paragraph.add_run(full_text[:placeholder_start])
-                        if char_formats and placeholder_start < len(char_formats):
-                            format_info = char_formats[placeholder_start - 1]
-                            if format_info['bold'] is not None:
-                                run.bold = format_info['bold']
-                            if format_info['italic'] is not None:
-                                run.italic = format_info['italic']
-                    
-                    # Add the replacement text with the same formatting as the placeholder
-                    if placeholder_start < len(char_formats):
-                        format_info = char_formats[placeholder_start]
-                        run = paragraph.add_run(replacement)
-                        if format_info['bold'] is not None:
-                            run.bold = format_info['bold']
-                        if format_info['italic'] is not None:
-                            run.italic = format_info['italic']
-                        if format_info['underline'] is not None:
-                            run.underline = format_info['underline']
-                        if format_info['font_name']:
-                            run.font.name = format_info['font_name']
-                        if format_info['font_size']:
-                            run.font.size = format_info['font_size']
-                    else:
-                        paragraph.add_run(replacement)
-                    
-                    # Add the text after placeholder
-                    text_after = full_text[placeholder_start + len(placeholder):]
-                    if text_after:
-                        run = paragraph.add_run(text_after)
-                        if char_formats and placeholder_start + len(placeholder) < len(char_formats):
-                            format_info = char_formats[placeholder_start + len(placeholder)]
-                            if format_info['bold'] is not None:
-                                run.bold = format_info['bold']
-                            if format_info['italic'] is not None:
-                                run.italic = format_info['italic']
+                self._style_as_body_run(run)
+
+        # Table narrative cells (e.g. reconciliation notes) — keep values readable
+        for table in doc.tables:
+            for row in table.rows:
+                for cell in row.cells:
+                    for paragraph in cell.paragraphs:
+                        if len(paragraph.text.strip()) > 80:
+                            for run in paragraph.runs:
+                                self._style_as_body_run(run)
+
+    def _collapse_empty_spacing(self, doc: Document) -> None:
+        """Remove consecutive empty paragraphs that create large white gaps.
+
+        Never remove paragraphs that carry a page break — those look empty in
+        .text but are the only thing keeping TOC / cover / body on separate pages.
+        """
+        paragraphs = list(doc.paragraphs)
+        empty_streak = 0
+        to_remove = []
+        for paragraph in paragraphs:
+            text = paragraph.text.strip()
+            xml = paragraph._element.xml
+            has_drawing = "w:drawing" in xml
+            has_page_break = 'w:type="page"' in xml
+            if has_page_break:
+                empty_streak = 0
+                continue
+            if not text and not has_drawing:
+                empty_streak += 1
+                # Keep at most one blank paragraph in a row
+                if empty_streak > 1:
+                    to_remove.append(paragraph._element)
+            else:
+                empty_streak = 0
+        for element in to_remove:
+            parent = element.getparent()
+            if parent is not None:
+                parent.remove(element)
 
     def _replace_text_in_document(self, doc: Document, replacements: Dict[str, str]):
         """Replace text in all parts of the document while preserving formatting"""

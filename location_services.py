@@ -68,14 +68,18 @@ class HybridLocationService:
         raise ValueError("No geocoding provider available")
 
     def get_aerial_image(self, lat: float, lng: float, output_path: Path) -> Optional[str]:
+        # Prefer Google Static Maps when available (client aerial preference), Esri as fallback
+        if self.google_api_key:
+            try:
+                return self._get_aerial_google(lat, lng, output_path)
+            except Exception as exc:
+                logger.warning("Google aerial image failed, trying Esri fallback: %s", exc)
+
         if self.esri_api_key:
             try:
                 return self._get_aerial_esri(lat, lng, output_path)
             except Exception as exc:
-                logger.warning("Esri aerial image failed, trying Google fallback: %s", exc)
-
-        if self.google_api_key:
-            return self._get_aerial_google(lat, lng, output_path)
+                logger.warning("Esri aerial image failed: %s", exc)
 
         logger.warning("No aerial imagery provider available")
         return None
@@ -259,11 +263,14 @@ class HybridLocationService:
         return str(output_path)
 
     def _get_aerial_google(self, lat: float, lng: float, output_path: Path) -> str:
+        # Request JPEG explicitly — template media parts are .jpg; PNG-in-JPEG
+        # makes Word show the broken-image placeholder on the cover.
         params = {
             "center": f"{lat},{lng}",
             "zoom": "18",
             "size": "1920x1920",
             "maptype": "hybrid",
+            "format": "jpg",
             "key": self.google_api_key,
             "markers": f"{lat},{lng}",
         }
@@ -271,6 +278,9 @@ class HybridLocationService:
         response.raise_for_status()
 
         output_path.parent.mkdir(parents=True, exist_ok=True)
+        # Keep extension consistent with template (.jpg) even if path said otherwise
+        if output_path.suffix.lower() not in (".jpg", ".jpeg"):
+            output_path = output_path.with_suffix(".jpg")
         output_path.write_bytes(response.content)
         return str(output_path)
 

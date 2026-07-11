@@ -159,10 +159,25 @@ def replace_narratives(doc):
                 break
 
 
+def fix_prepared_for_address(doc):
+    """In PREPARED FOR textboxes, the client address must not reuse {{address}}."""
+    count = 0
+    for txbx in doc.element.body.iter(qn("w:txbxContent")):
+        texts = "".join((t.text or "") for t in txbx.iter(W_T))
+        if "PREPARED FOR" not in texts:
+            continue
+        for t in txbx.iter(W_T):
+            if t.text and t.text.strip() == "{{address}}":
+                t.text = "{{prepared_for_address}}"
+                count += 1
+    return count
+
+
 def main():
     doc = Document(SOURCE)
 
     tb = replace_in_textboxes(doc, TEXTBOX_MAP)
+    pf = fix_prepared_for_address(doc)
 
     cells = 0
     for (ti, ri, ci), placeholder in TABLE_MAP.items():
@@ -175,7 +190,7 @@ def main():
     replace_narratives(doc)
 
     doc.save(OUTPUT)
-    print(f"Wrote {OUTPUT}: {tb} textbox values, {cells} table cells, narratives parameterized")
+    print(f"Wrote {OUTPUT}: {tb} textbox values, {pf} prepared_for_address, {cells} table cells, narratives parameterized")
     print(f"Tables preserved: {len(doc.tables)} | paragraphs: {len(doc.paragraphs)}")
 
     # Remove any remaining static market/comps sample blocks
