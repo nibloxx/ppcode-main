@@ -61,6 +61,20 @@ def replace_in_textboxes(doc, mapping):
     return count
 
 
+def preserve_prepared_label_spaces(doc):
+    """Keep the trailing space after PREPARED BY:/FOR: (Word drops it without xml:space)."""
+    fixed = 0
+    for t in doc.element.body.iter(W_T):
+        if not t.text:
+            continue
+        stripped = t.text.strip()
+        if stripped in ("PREPARED BY:", "PREPARED FOR:"):
+            t.text = stripped + " "
+            t.set(qn("xml:space"), "preserve")
+            fixed += 1
+    return fixed
+
+
 # ---- Table cell replacements by (table, row, col) ----
 TABLE_MAP = {
     # Valuation summary (Table 1)
@@ -163,6 +177,7 @@ def main():
     doc = Document(SOURCE)
 
     tb = replace_in_textboxes(doc, TEXTBOX_MAP)
+    labels = preserve_prepared_label_spaces(doc)
 
     cells = 0
     for (ti, ri, ci), placeholder in TABLE_MAP.items():
@@ -175,7 +190,7 @@ def main():
     replace_narratives(doc)
 
     doc.save(OUTPUT)
-    print(f"Wrote {OUTPUT}: {tb} textbox values, {cells} table cells, narratives parameterized")
+    print(f"Wrote {OUTPUT}: {tb} textbox values, {labels} prepared-label spaces, {cells} table cells, narratives parameterized")
     print(f"Tables preserved: {len(doc.tables)} | paragraphs: {len(doc.paragraphs)}")
 
     # Remove any remaining static market/comps sample blocks

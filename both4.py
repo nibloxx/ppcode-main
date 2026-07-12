@@ -792,7 +792,7 @@ Start with the line "Sources Used:" then a numbered list "1. ", "2. ", etc. Plai
             prepared_for_company=prepared_for_company,
             prepared_for_address=prepared_for_address,
             property_name=property_name or f"{address_details.get('city', 'Property')} {property_type}",
-            property_type=property_type,
+            property_type=(property_type or "").strip().title(),
             state=address_details.get('state', ''),
             county=address_details.get('county', ''),
             latitude=str(lat),
@@ -1219,6 +1219,11 @@ Start with the line "Sources Used:" then a numbered list "1. ", "2. ", etc. Plai
                 for placeholder, value in replacements.items():
                     if placeholder in new_text:
                         new_text = new_text.replace(placeholder, value if value is not None else "")
+                # Word drops trailing spaces unless xml:space="preserve"
+                stripped = new_text.strip()
+                if stripped in ("PREPARED BY:", "PREPARED FOR:"):
+                    new_text = stripped + " "
+                    node.set(qn("xml:space"), "preserve")
                 if new_text != node.text:
                     node.text = new_text
 
@@ -1414,7 +1419,7 @@ Start with the line "Sources Used:" then a numbered list "1. ", "2. ", etc. Plai
             '{{prepared_for_address}}': property_data.prepared_for_address,
             '{{property_summary}}': property_data.property_summary,
             '{{property_name}}': property_data.property_name,
-            '{{property_type}}': property_data.property_type,
+            '{{property_type}}': (property_data.property_type or "").strip().title(),
             '{{state}}': property_data.state,
             '{{county}}': property_data.county,
             '{{longitude}}': property_data.longitude,
@@ -1486,13 +1491,23 @@ Start with the line "Sources Used:" then a numbered list "1. ", "2. ", etc. Plai
         # Refresh employment table with recent-year data (not static 2010-2019 sample)
         if property_data.bov_dataset:
             self._fill_employment_table(doc, property_data.bov_dataset, property_data.county, property_data.state)
+
+        # Collapse leftover empty paragraphs that create large white gaps
+        # (never deletes paragraphs that carry a page break).
+        self._collapse_empty_spacing(doc)
+
+        # TOC is a full-page floating blue panel — without a page break before
+        # EXECUTIVE SUMMARY, body text renders underneath it (page-2 bleed).
+        self._ensure_page_break_before_heading(doc, "EXECUTIVE SUMMARY")
         
         # Remove the programmatic market analysis section since we're using placeholders
         # self._create_market_analysis_section(doc, property_data)
-        
-        # Generate output filename
-        safe_address = "".join(c for c in property_data.address if c.isalnum() or c in (' ', '-', '_')).rstrip()
-        output_filename = f"Property_Report_{safe_address}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.docx"
+
+        # Clean, client-friendly filename: BOV_<Property Name or Address>_<date>_<time>.docx
+        label = (property_data.property_name or "").strip() or property_data.address
+        safe_label = "".join(c for c in label if c.isalnum() or c in (" ", "-", "_")).strip()
+        safe_label = "_".join(safe_label.split())[:60]
+        output_filename = f"BOV_{safe_label}_{datetime.now().strftime('%Y-%m-%d_%H%M')}.docx"
         output_path = self.output_dir / output_filename
         
         # Save document
@@ -1504,6 +1519,98 @@ Start with the line "Sources Used:" then a numbered list "1. ", "2. ", etc. Plai
             self._apply_color_theme(output_path, color_theme)
         
         return str(output_path)
+
+    @staticmethod
+    def _paragraph_has_page_break(paragraph) -> bool:
+        """True if this paragraph contains an explicit page break."""
+        from docx.oxml.ns import qn
+
+        return any(
+            br.get(qn("w:type")) == "page"
+            for br in paragraph._element.iter(qn("w:br"))
+        )
+
+    def _collapse_empty_spacing(self, doc: Document) -> None:
+        """Remove consecutive empty paragraphs that create large white gaps.
+
+        Never deletes a paragraph that carries a page break — those look
+        \"empty\" in paragraph.text but are required for TOC / section layout.
+        """
+        empty_streak = 0
+        to_remove = []
+        for paragraph in doc.paragraphs:
+            text = paragraph.text.strip()
+            has_drawing = bool(
+                paragraph._element.xpath(".//*[local-name()='drawing']")
+            )
+            has_page_break = self._paragraph_has_page_break(paragraph)
+            if has_page_break:
+                empty_streak = 0
+                continue
+            if not text and not has_drawing:
+                empty_streak += 1
+                # Keep at most one blank paragraph in a row
+                if empty_streak > 1:
+                    to_remove.append(paragraph._element)
+            else:
+                empty_streak = 0
+        for element in to_remove:
+            parent = element.getparent()
+            if parent is not None:
+                parent.remove(element)
+        if to_remove:
+            logger.info("Collapsed %d extra empty paragraphs", len(to_remove))
+
+    def _ensure_page_break_before_heading(self, doc: Document, heading: str) -> None:
+        """Insert a page break immediately before `heading` if one is missing.
+
+        The TOC page uses a full-page floating blue shape. Body text after the
+        TOC table must start on the next page or it renders on top of the TOC.
+        """
+        from docx.oxml import OxmlElement
+        from docx.oxml.ns import qn
+
+        target = None
+        for paragraph in doc.paragraphs:
+            if heading in paragraph.text:
+                target = paragraph
+                break
+        if target is None:
+            return
+
+        # Already has pageBreakBefore on the heading?
+        pPr = target._element.find(qn("w:pPr"))
+        if pPr is not None and pPr.find(qn("w:pageBreakBefore")) is not None:
+            return
+
+        # Look back a few siblings for an existing page break (skip blank paras)
+        prev = target._element.getprevious()
+        checked = 0
+        while prev is not None and checked < 4:
+            if prev.tag == qn("w:p"):
+                if any(br.get(qn("w:type")) == "page" for br in prev.iter(qn("w:br"))):
+                    return
+                # Stop looking once we hit real content (e.g. TOC table already passed)
+                text = "".join(t.text or "" for t in prev.iter(qn("w:t"))).strip()
+                has_drawing = any(True for _ in prev.iter(qn("w:drawing")))
+                if text or has_drawing:
+                    break
+                checked += 1
+                prev = prev.getprevious()
+            elif prev.tag == qn("w:tbl"):
+                break
+            else:
+                prev = prev.getprevious()
+
+        # Insert an explicit page-break paragraph before the heading
+        new_p = OxmlElement("w:p")
+        new_r = OxmlElement("w:r")
+        new_br = OxmlElement("w:br")
+        new_br.set(qn("w:type"), "page")
+        new_r.append(new_br)
+        new_p.append(new_r)
+        target._element.addprevious(new_p)
+        logger.info("Inserted page break before %s", heading)
 
     # Template accent colors -> theme replacements (primary, secondary)
     COLOR_THEMES = {
