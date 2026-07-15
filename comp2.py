@@ -42,6 +42,7 @@ class CompProperty:
     listing_broker_phone: str = ""
     listing_broker_email: str = ""
     image_path: Optional[str] = None
+    page_image_path: Optional[str] = None  # Full CoStar PDF page render (preferred in BOV)
 
 class CompExtractor:
     """Extract comparable property data from PDF files and replace keywords in Word documents"""
@@ -79,7 +80,9 @@ class CompExtractor:
                 # Parse all comps from the full text
                 comps = self._parse_all_comps(full_text)
             
-            # Extract images using PyMuPDF
+            # Prefer full-page CoStar renders so BOV comps match the source layout
+            self._render_comp_pages(pdf_path, comps)
+            # Fallback: embedded map/photo crops if page render failed
             self._extract_images_from_pdf(pdf_path, comps)
             
             logger.info(f"Successfully extracted {len(comps)} comps from PDF")
@@ -306,67 +309,229 @@ class CompExtractor:
         
         return info
     
+    def _comp_start_pages(self, pdf_document) -> List[int]:
+        """Return PDF page indexes that start a new comparable."""
+        pages = []
+        for page_num in range(pdf_document.page_count):
+            text = pdf_document[page_num].get_text() or ""
+            if re.search(r"\d+\.\s+Sold (?:Land )?(?:Property|Space|Building)", text):
+                pages.append(page_num)
+            elif re.search(r"Sale Comp ID:\s*\d+", text) and (
+                not pages or page_num > pages[-1]
+            ):
+                pages.append(page_num)
+        return pages
+
+    def _trim_pixmap(self, pix) -> "fitz.Pixmap":
+        """Crop mostly-white margins so single-card pages pack better (2 per Word page)."""
+        try:
+            import fitz
+
+            # Walk inward for near-white rows/cols (CoStar cards sit on white)
+            samples = pix.samples
+            w, h, n = pix.width, pix.height, pix.n
+            if w < 40 or h < 40 or n < 3:
+                return pix
+
+            def row_blank(y: int) -> bool:
+                base = y * w * n
+                step = max(1, w // 80)
+                for x in range(0, w, step):
+                    i = base + x * n
+                    if samples[i] < 245 or samples[i + 1] < 245 or samples[i + 2] < 245:
+                        return False
+                return True
+
+            def col_blank(x: int) -> bool:
+                step = max(1, h // 80)
+                for y in range(0, h, step):
+                    i = (y * w + x) * n
+                    if samples[i] < 245 or samples[i + 1] < 245 or samples[i + 2] < 245:
+                        return False
+                return True
+
+            top = 0
+            while top < h - 20 and row_blank(top):
+                top += 1
+            bottom = h - 1
+            while bottom > top + 20 and row_blank(bottom):
+                bottom -= 1
+            left = 0
+            while left < w - 20 and col_blank(left):
+                left += 1
+            right = w - 1
+            while right > left + 20 and col_blank(right):
+                right -= 1
+
+            # Keep a little padding
+            pad = 8
+            top = max(0, top - pad)
+            left = max(0, left - pad)
+            bottom = min(h - 1, bottom + pad)
+            right = min(w - 1, right + pad)
+
+            if top <= 2 and left <= 2 and bottom >= h - 3 and right >= w - 3:
+                return pix
+            rect = fitz.IRect(left, top, right + 1, bottom + 1)
+            return fitz.Pixmap(pix, rect)
+        except Exception as exc:
+            logger.warning("Comp page trim skipped: %s", exc)
+            return pix
+
+    def _render_comp_pages(self, pdf_path: str, comps: List[CompProperty]) -> None:
+        """Render unique CoStar PDF pages (trimmed) and attach to comps.
+
+        Pages that already show 2 cards stay one image; single-card pages are
+        trimmed so Word can pack ~2 images per page.
+        """
+        if not comps:
+            return
+        try:
+            import fitz
+
+            pdf_document = fitz.open(pdf_path)
+            start_pages = self._comp_start_pages(pdf_document)
+
+            # Fallback: one page per comp in order when headers aren't detected
+            if len(start_pages) < 1:
+                start_pages = list(range(min(len(comps), pdf_document.page_count)))
+
+            # Deduplicate page indexes while preserving order
+            seen_pages = set()
+            unique_pages = []
+            for p in start_pages:
+                if p not in seen_pages:
+                    seen_pages.add(p)
+                    unique_pages.append(p)
+
+            matrix = fitz.Matrix(2.0, 2.0)
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            page_paths: Dict[int, str] = {}
+
+            for page_num in unique_pages:
+                page = pdf_document[page_num]
+                pix = page.get_pixmap(matrix=matrix, alpha=False)
+                pix = self._trim_pixmap(pix)
+                out_path = self.images_dir / f"comp_page_{page_num + 1}_{timestamp}.png"
+                pix.save(str(out_path))
+                page_paths[page_num] = str(out_path)
+                logger.info(
+                    "Rendered CoStar page %d -> %s",
+                    page_num + 1,
+                    out_path.name,
+                )
+
+            # Attach each unique page image to the first unmatched comp whose
+            # number appears on that page; then fall back by page order.
+            assigned = set()
+            for page_num, path in page_paths.items():
+                text = pdf_document[page_num].get_text() or ""
+                matched = False
+                for comp in comps:
+                    if comp.comp_number in assigned:
+                        continue
+                    if re.search(
+                        rf"(?m)^\s*{comp.comp_number}\.\s+Sold\b", text
+                    ) or re.search(
+                        rf"\b{comp.comp_number}\.\s+Sold (?:Land )?(?:Property|Space|Building)",
+                        text,
+                    ):
+                        comp.page_image_path = path
+                        comp.image_path = path
+                        assigned.add(comp.comp_number)
+                        matched = True
+                        break
+                if not matched:
+                    # Page may hold 2+ comps — mark only once; insert dedupes by path
+                    for comp in comps:
+                        if comp.comp_number in assigned:
+                            continue
+                        if not comp.page_image_path:
+                            comp.page_image_path = path
+                            comp.image_path = path
+                            assigned.add(comp.comp_number)
+                            break
+
+            # Any leftover comps get sequential leftover pages if available
+            leftover_pages = [p for p in unique_pages if p in page_paths]
+            li = 0
+            for comp in comps:
+                if comp.page_image_path:
+                    continue
+                if li < len(leftover_pages):
+                    path = page_paths[leftover_pages[li]]
+                    comp.page_image_path = path
+                    comp.image_path = path
+                    li += 1
+
+            pdf_document.close()
+        except Exception as e:
+            logger.error("Error rendering comp PDF pages: %s", e)
+
     def _extract_images_from_pdf(self, pdf_path: str, comps: List[CompProperty]):
-        """Extract images from PDF and associate with comps"""
+        """Extract embedded images from PDF as fallback when page render is missing."""
         try:
             pdf_document = fitz.open(pdf_path)
-            
-            # Create a mapping of page numbers to comp numbers
-            # This assumes comps appear in order in the PDF
+
             comp_page_map = {}
             current_comp_idx = 0
-            
+
             for page_num in range(pdf_document.page_count):
                 page = pdf_document[page_num]
                 page_text = page.get_text()
-                
-                # Check if this page contains a new comp
-                if re.search(r'\d+\.\s+Sold Land (?:Property|Space)', page_text):
+
+                if re.search(r"\d+\.\s+Sold (?:Land )?(?:Property|Space|Building)", page_text):
                     comp_page_map[page_num] = current_comp_idx
                     current_comp_idx += 1
                 elif current_comp_idx > 0:
-                    # Continue with the same comp if no new comp found
                     comp_page_map[page_num] = current_comp_idx - 1
-            
-            # Extract images
+
             for page_num in range(pdf_document.page_count):
                 if page_num not in comp_page_map:
                     continue
-                    
+
                 comp_idx = comp_page_map[page_num]
                 if comp_idx >= len(comps):
                     continue
-                
+                # Skip if we already have a full-page render
+                if comps[comp_idx].page_image_path or comps[comp_idx].image_path:
+                    continue
+
                 page = pdf_document[page_num]
                 image_list = page.get_images(full=True)
-                
+
                 for img_index, img in enumerate(image_list):
-                    if not comps[comp_idx].image_path:  # Only take first image per comp
+                    if not comps[comp_idx].image_path:
                         try:
-                            # Extract the image
                             xref = img[0]
                             base_image = pdf_document.extract_image(xref)
                             image_bytes = base_image["image"]
                             image_ext = base_image["ext"]
-                            
-                            # Save the image
+
                             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                             image_filename = f"comp_{comps[comp_idx].comp_number}_{timestamp}.{image_ext}"
                             image_path = self.images_dir / image_filename
-                            
+
                             with open(image_path, "wb") as img_file:
                                 img_file.write(image_bytes)
-                            
+
                             comps[comp_idx].image_path = str(image_path)
-                            logger.info(f"Extracted image for comp {comps[comp_idx].comp_number}")
-                            
+                            logger.info(
+                                "Extracted fallback image for comp %s",
+                                comps[comp_idx].comp_number,
+                            )
                         except Exception as e:
-                            logger.error(f"Error extracting image {img_index} on page {page_num}: {e}")
-            
+                            logger.error(
+                                "Error extracting image %s on page %s: %s",
+                                img_index,
+                                page_num,
+                                e,
+                            )
+
             pdf_document.close()
-            
+
         except Exception as e:
-            logger.error(f"Error extracting images from PDF: {e}")
+            logger.error("Error extracting images from PDF: %s", e)
     
     def create_comp_replacements(self, comps: List[CompProperty]) -> Dict[str, str]:
         """

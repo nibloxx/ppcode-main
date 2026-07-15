@@ -106,6 +106,7 @@ class PropertyReportData:
     regional_analysis: str = ""
     sales_conclusion: str = ""
     reconciliation_summary: str = ""
+    reconciliation_notes: str = ""
 
     # Comparable sales extracted from uploaded CoStar PDF (optional)
     comps: List[Any] = field(default_factory=list)
@@ -165,7 +166,7 @@ class ComprehensivePropertyReportGenerator:
         street_view_path = None
         
         try:
-            logger.info("Fetching aerial image via Esri (Google fallback)...")
+            logger.info("Fetching aerial image via Google Static Maps (Esri fallback)...")
             aerial_filename = f"aerial_{timestamp}.jpg"
             aerial_path = self.location_service.get_aerial_image(
                 lat, lng, self.images_dir / aerial_filename
@@ -176,10 +177,15 @@ class ComprehensivePropertyReportGenerator:
             logger.info("Fetching Street View image via Google...")
             street_view_filename = f"street_view_{timestamp}.jpg"
             street_view_path = self.location_service.get_street_view_image(
-                address, self.images_dir / street_view_filename
+                address,
+                self.images_dir / street_view_filename,
+                lat=lat,
+                lng=lng,
             )
             if street_view_path:
                 logger.info("Street view image saved: %s", street_view_path)
+            else:
+                logger.warning("No Street View image available; SUBJECT PHOTOS will be empty")
                 
         except Exception as e:
             logger.error(f"Error fetching images: {e}")
@@ -260,6 +266,7 @@ class ComprehensivePropertyReportGenerator:
             "total_vacancy": 18.22,
             "avg_lease_rate": 24.33,
             "lease_rate_yoy": "-0.04",
+            "cap_rate": 6.7,
             "class_a_rate": 27.13,
             "class_b_rate": 22.03,
             "class_c_rate": 19.44,
@@ -302,6 +309,7 @@ class ComprehensivePropertyReportGenerator:
                 "total_vacancy": 18.22,
                 "avg_lease_rate": 24.33,
                 "lease_rate_yoy": "-0.04",
+                "cap_rate": 6.7,
                 "class_a_rate": 27.13,
                 "class_b_rate": 22.03,
                 "class_c_rate": 19.44,
@@ -332,27 +340,54 @@ Plain text only. No markdown, no bullet points, no headings."""
         return self._get_ai_response(prompt)
 
     def _generate_vacancy_rates(self, context: str, property_type: str, market_data: Dict) -> str:
-        """Generate vacancy rates section with formatted data"""
-        
-        # Generate clean text without any formatting markers
-        vacancy_section = f"""-   Direct Vacancy: {market_data.get('direct_vacancy', 12.71)}% ({market_data.get('direct_qoq', '+1.02')}% QoQ, {market_data.get('direct_yoy', '+1.68')}% YoY)
+        """Generate Key Market Metrics bullets in CLIENT-report style (proxy metrics + Note)."""
+        county = self._ctx_value(context, "County")
+        state = self._ctx_value(context, "State")
+        quarter = market_data.get("quarter", self._current_quarter())
+        vacancy = market_data.get("total_vacancy", "n/a")
+        rent = market_data.get("avg_lease_rate", "n/a")
+        construction_sf = market_data.get("construction_sf", 0) or 0
+        cap_rate = market_data.get("cap_rate", "n/a")
 
--   Sublease Vacancy: {market_data.get('sublease_vacancy', 5.51)}% ({market_data.get('sublease_qoq', '-0.39')}% QoQ)
+        prompt = f"""Write the Key Market Metrics block under "Vacancy Rates" for a {property_type}
+property in {county}, {state}, as of {quarter}.
 
--   Total Vacancy: {market_data.get('total_vacancy', 18.22)}%"""
-        
-        return vacancy_section
+Match this EXACT structure and tone (plain text only — no markdown, no **bold** markers):
+
+• Vacancy (metro proxy): {vacancy}% ({quarter}); <one short sentence on metro trend and how {county} typically tracks it>.
+• Asking Rents (metro proxy): ~${rent}/SF market asking rent ({quarter}), with brief rent-growth context. Note that {property_type} reporting is not commonly split into Class A/B.
+• Construction Pipeline (metro): ~{int(construction_sf):,} SF under construction as of {quarter}; one short pipeline/delivery note.
+• Investment Indicators (metro): Average {property_type} capitalization rate ~{cap_rate}% ({quarter}).
+Note: Reliable {county}-only breakouts for {property_type} vacancy and asking rents are limited; metro-level metrics are the accepted proxy in most public reports and broker opinions of value.
+
+Rules:
+- One bullet per line, each starting with "• " (bullet character + space).
+- After the four bullets, one "Note:" paragraph (no bullet).
+- Separate each item with a blank line.
+- Do NOT output Direct/Sublease/Total vacancy line items.
+- Do NOT invent other counties/states. Ground everything in {county}, {state} / its metro.
+"""
+        return self._get_ai_response(prompt)
 
     def _generate_lease_rates(self, context: str, property_type: str, market_data: Dict) -> str:
-        """Generate lease rates section (data-driven, market-specific numbers)."""
-        lease_section = f"""-   Overall Average: ${market_data.get('avg_lease_rate', 'n/a')}/SF (${market_data.get('lease_rate_yoy', 'n/a')} YoY)
+        """Generate lease-rates prose (CLIENT style) — not Class A/B/C bullet lists."""
+        county = self._ctx_value(context, "County")
+        state = self._ctx_value(context, "State")
+        quarter = market_data.get("quarter", self._current_quarter())
+        rent = market_data.get("avg_lease_rate", "n/a")
+        rent_yoy = market_data.get("lease_rate_yoy", "n/a")
 
--   Class A: ${market_data.get('class_a_rate', 'n/a')}/SF
+        prompt = f"""Write ONE short paragraph for "Lease Rates (Based on Public Listings & Industry Trends)"
+for {property_type} in {county}, {state}, as of {quarter}.
 
--   Class B: ${market_data.get('class_b_rate', 'n/a')}/SF
+Style example:
+"{property_type} lease rates in {county} generally align with broader metro trends, averaging around ${rent}/SF as of {quarter}. Annual rent growth has remained steady{'' if rent_yoy == 'n/a' else f' ({rent_yoy} YoY)'}, supported by disciplined supply and healthy tenant demand in well-located corridors."
 
--   Class C: ${market_data.get('class_c_rate', 'n/a')}/SF"""
-        return lease_section
+Rules:
+- Plain text only, single paragraph, no bullets, no Class A/B/C splits, no markdown.
+- Keep it to 2–4 sentences. Do not reference other markets.
+"""
+        return self._get_ai_response(prompt)
 
     def _generate_construction_activity(self, context: str, property_type: str, market_data: Dict) -> str:
         """Generate a location-specific construction activity section via AI."""
@@ -369,7 +404,7 @@ Use these figures: approximately {int(construction_sf):,} SF under construction,
 Reference realistic, plausible recent deliveries and pipeline trends specific to {county}, {state}.
 Do NOT reference any other market (no Salt Lake, Lehi, Provo, etc. unless that is the actual county/state).
 
-Return 2-3 concise bullet points, each starting with "-   ". Plain text only."""
+Return 2-3 concise bullet points, each starting with "• ". Plain text only. Separate bullets with blank lines."""
         return self._get_ai_response(prompt)
 
     def _generate_market_trends(self, context: str, property_type: str, market_data: Dict) -> str:
@@ -383,8 +418,9 @@ Return 2-3 concise bullet points, each starting with "-   ". Plain text only."""
 {f'Relevant current themes to weave in: {trends}.' if trends else ''}
 Cover 3-4 distinct trends (e.g., population/employment growth, leasing flexibility/sublease, supply pipeline,
 hybrid-work or e-commerce effects) as they specifically apply to {county}, {state} and to {property_type}.
-Do NOT reference any other market. Format each trend as a short bolded-style label line followed by a "-   " bullet.
-Plain text only, no markdown symbols."""
+Do NOT reference any other market.
+Format: each trend is one bullet starting with "• " and a short label then colon (e.g. "• Demand skew to small shops: ...").
+Separate bullets with blank lines. Plain text only — no markdown (no **, *, #, or backticks)."""
         return self._get_ai_response(prompt)
 
     def _generate_investment_insights(self, context: str, property_type: str, market_data: Dict) -> str:
@@ -394,20 +430,45 @@ Plain text only, no markdown symbols."""
 
         prompt = f"""Write "Investment Insights" for a {property_type} property in {county}, {state}.
 Provide 3 concise, actionable insights grounded in the local {county}, {state} market and {property_type} fundamentals.
-Do NOT reference any other market. Return 3 bullet points, each starting with "-   " and leading with a short bold-style label.
-Plain text only."""
+Do NOT reference any other market.
+Return 3 bullets, each starting with "• " and a short label then colon. Separate with blank lines.
+Plain text only — no markdown (no **, *, #, or backticks)."""
         return self._get_ai_response(prompt)
 
     def _generate_market_recommendations(self, context: str, property_type: str, market_data: Dict) -> str:
-        """Generate location-specific recommendations via AI."""
-        county = self._ctx_value(context, 'County')
-        state = self._ctx_value(context, 'State')
+        """Generate location-specific recommendations via AI (CLIENT short-bullet style)."""
+        county = self._ctx_value(context, "County")
+        state = self._ctx_value(context, "State")
 
-        prompt = f"""Write "Recommendations" for a {property_type} BOV in {county}, {state}.
-Give 3 recommendations addressed to Investors, Tenants, and Developers respectively, grounded in current
-{county}, {state} {property_type} conditions. Do NOT reference any other market.
-Return 3 bullet points, each starting with "-   " and leading with the audience label. Plain text only."""
+        prompt = f"""Write "Recommendations" for a {property_type} Broker Opinion of Value in {county}, {state}.
+
+Return EXACTLY 3 short bullets in this style (plain text only):
+• Prioritize <one concrete action grounded in {county} {property_type} conditions>.
+• Target <one concrete leasing / tenant / location action>.
+• For value-add, focus on <one concrete underwriting / lease-up / mark-to-market action>.
+
+Rules:
+- Each bullet is ONE sentence (max ~35 words). Start with "• ".
+- Separate bullets with a blank line.
+- Do NOT use markdown (no **, no *, no #, no backticks).
+- Do NOT label bullets as Investors / Tenants / Developers.
+- Do NOT reference any other market.
+"""
         return self._get_ai_response(prompt)
+
+    @staticmethod
+    def _strip_markdown(text: str) -> str:
+        """Remove common markdown markers AI sometimes emits into Word body text."""
+        if not text:
+            return text or ""
+        # Bold / italic
+        text = re.sub(r"\*\*(.+?)\*\*", r"\1", text)
+        text = re.sub(r"__(.+?)__", r"\1", text)
+        text = re.sub(r"(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)", r"\1", text)
+        text = re.sub(r"`([^`]+)`", r"\1", text)
+        # Headings / list markers that are not our bullets
+        text = re.sub(r"(?m)^#{1,6}\s*", "", text)
+        return text
 
     def _generate_data_sources(self, context: str = "", property_type: str = "", market_data: Dict = None) -> str:
         """Generate a current, market-relevant data sources list via AI."""
@@ -417,15 +478,32 @@ Return 3 bullet points, each starting with "-   " and leading with the audience 
         quarter = market_data.get('quarter', self._current_quarter())
         year = datetime.now().year
 
-        prompt = f"""List 6 realistic, current ({year}) data sources that would support a {property_type} Broker Opinion
+        prompt = f"""Write the "Data Sources & Disclaimer" sources block for a {property_type} Broker Opinion
 of Value in {county}, {state}, as of {quarter}.
-Include a mix of: a major brokerage market report relevant to the {county}/{state} metro, US Census Bureau,
-Esri GeoEnrichment / Business Analyst, U.S. Bureau of Labor Statistics, a local/regional economic development
-or business source, and public county assessor/property records.
-Every source must be dated {year} (or "current"/"latest"), never older than the last two years.
-Do NOT invent Utah-specific sources unless the property is in Utah.
-Start with the line "Sources Used:" then a numbered list "1. ", "2. ", etc. Plain text only."""
-        return self._get_ai_response(prompt)
+
+Match this EXACT structure (plain text only — no markdown):
+
+This analysis relies on multiple public sources:
+
+• CoStar – {county}/{state} metro {property_type} Market {quarter} (vacancy rates, rental rates, absorption)
+• CBRE / JLL / similar brokerage – {property_type} Market Report {quarter} (market trends and leasing activity)
+• U.S. Census Bureau – latest population, income, and housing statistics for {county}, {state}
+• Esri Business Analyst / GeoEnrichment – current demographic and consumer spending data
+• U.S. Bureau of Labor Statistics – current employment and unemployment data
+• Local county appraisal / assessor records – public property records for {county}
+
+Rules:
+- Start with the italic-style intro line exactly: "This analysis relies on multiple public sources:"
+- Then 5–6 bullets, each starting with "• " (bullet character). Separate bullets with blank lines.
+- Do NOT use a numbered list (no "1.", "2.", "Sources Used:").
+- Keep each bullet to one line. Sources must be current ({year} / {quarter}), not older than two years.
+- Do NOT invent Utah-specific sources unless the property is in Utah.
+"""
+        text = self._get_ai_response(prompt)
+        # Force CLIENT-style bullets even if the model returns "1. 2. 3."
+        text = text.replace("Sources Used:", "This analysis relies on multiple public sources:")
+        text = re.sub(r"(?m)^\s*\d+\.\s+", "• ", text)
+        return text
 
     @staticmethod
     def _ctx_value(context: str, label: str) -> str:
@@ -459,8 +537,8 @@ Start with the line "Sources Used:" then a numbered list "1. ", "2. ", etc. Plai
             'market_recommendations': self._generate_market_recommendations(context, property_type, market_data),
             'market_data_sources': self._generate_data_sources(context, property_type, market_data)
         }
-        
-        return sections
+        # Word shows literal **bold** if markdown slips through — strip it
+        return {k: self._strip_markdown(v) for k, v in sections.items()}
 
     def generate_comprehensive_content(self, address: str, property_data: PropertyReportData) -> PropertyReportData:
         """
@@ -539,27 +617,32 @@ Start with the line "Sources Used:" then a numbered list "1. ", "2. ", etc. Plai
             f"{comp_context}"
             f"Summarize location, key value drivers, and the value conclusion. Plain text only.",
         )
-        property_data.regional_analysis = self._get_ai_response(
-            f"Write a detailed 2-paragraph regional analysis for the area around the subject property, "
-            f"grounded specifically in {property_data.county}, {property_data.state}. "
-            f"Cover: population size and growth trend, household composition and income levels, key employers "
-            f"and industries, transportation/accessibility, and how these support demand for "
-            f"{property_data.property_type} space. Use recent ({datetime.now().year}) framing and consistent "
-            f"structure. Do not reference any other market. Context:\n{context}\nPlain text only.",
+        property_data.regional_analysis = self._shorten_regional_analysis(
+            self._get_ai_response(
+                f"Write a SHORT but worthy REGIONAL ANALYSIS for the subject in "
+                f"{property_data.county}, {property_data.state} ({datetime.now().year}).\n\n"
+                f"Match this style (plain text, no markdown, no bullets):\n"
+                f"Paragraph 1: population growth/size and household/income character that support "
+                f"{property_data.property_type} demand (2 sentences max).\n"
+                f"Paragraph 2: key employers/industries plus major roads/airport access and why that "
+                f"helps the local {property_data.property_type} market (2 sentences max).\n\n"
+                f"HARD LIMITS: exactly 2 paragraphs, blank line between them, 85-100 words TOTAL. "
+                f"Name concrete employers/roads when plausible. Never mention another county/state.\n"
+                f"Context:\n{context}",
+            )
         )
-        property_data.sales_conclusion = self._get_ai_response(
-            f"Write a 1-paragraph sales conclusion for a {property_data.property_type} BOV that ties "
-            f"the comparable sales to the concluded market value. Context:\n{context}\n"
-            f"{comp_context}"
-            f"Plain text only.",
-        )
+        # CLIENT layout: SALES CONCLUSION heading + OPINIONS OF VALUE table only
+        # (no long narrative between/after those elements)
+        property_data.sales_conclusion = ""
         property_data.reconciliation_summary = self._get_ai_response(
-            f"Write a 1-paragraph reconciliation summary explaining how the sales comparison approach "
-            f"supports the opinion of value for this {property_data.property_type}. Reference the comp "
-            f"price/SF range when comparable data is provided. Context:\n{context}\n"
-            f"{comp_context}"
-            f"Plain text only.",
+            f"Write 2 short sentences for the RECONCILIATION TABLE narrative (above the valuation grid). "
+            f"Mention the comparable $/SF range when comps are available and that the sales comparison "
+            f"approach supports the opinion of value for this {property_data.property_type}. "
+            f"Context:\n{context}\n{comp_context}"
+            f"Plain text only. Keep under 60 words.",
         )
+        # Short NOTES cell for the valuation grid (CLIENT style one-liner)
+        property_data.reconciliation_notes = self._build_reconciliation_notes(property_data)
 
         return property_data
 
@@ -576,6 +659,98 @@ Start with the line "Sources Used:" then a numbered list "1. ", "2. ", etc. Plai
                 f"{getattr(comp, 'comp_sf', '')} SF"
             )
         return "\n".join(lines) + "\n"
+
+    def _build_reconciliation_notes(self, property_data: "PropertyReportData") -> str:
+        """One-line NOTES cell for the valuation grid (CLIENT style)."""
+        comps = getattr(property_data, "comps", None) or []
+        n_comps = len(comps) if comps else 0
+
+        rounded = None
+        # Prefer finalized valuation from table_values when available
+        tv = getattr(property_data, "table_values", None) or {}
+        rounded = tv.get("{{market_value_rounded}}")
+        if not rounded and getattr(property_data, "bov_dataset", None):
+            val = (property_data.bov_dataset or {}).get("valuation") or {}
+            mv = val.get("market_value_rounded") or val.get("market_value")
+            if mv is not None:
+                try:
+                    rounded = f"${int(round(float(mv))):,}"
+                except (TypeError, ValueError):
+                    rounded = str(mv)
+
+        if not rounded:
+            rounded = "the concluded market value"
+
+        if n_comps > 0:
+            return (
+                f"The sales comparison approach yields a value of {rounded} "
+                f"based on the average $/SF from {n_comps} comparables."
+            )
+        return (
+            f"The sales comparison approach yields a value of {rounded} "
+            f"based on comparable sales analysis."
+        )
+
+    @staticmethod
+    def _shorten_regional_analysis(text: str, max_words: int = 100) -> str:
+        """Keep regional analysis to ~2 short paragraphs (CLIENT density)."""
+        if not text:
+            return ""
+        text = ComprehensivePropertyReportGenerator._strip_markdown(text).strip()
+        parts = [p.strip() for p in re.split(r"\n\s*\n", text) if p.strip()]
+        if len(parts) == 1:
+            sentences = re.split(r"(?<=[.!?])\s+", parts[0])
+            sentences = [s.strip() for s in sentences if s.strip()]
+            if len(sentences) >= 2:
+                mid = max(1, len(sentences) // 2)
+                parts = [" ".join(sentences[:mid]), " ".join(sentences[mid:])]
+            else:
+                parts = [parts[0]]
+        parts = parts[:2]
+
+        def _clip(paragraph: str, budget: int) -> str:
+            words = paragraph.split()
+            if len(words) <= budget:
+                return paragraph
+            clipped = " ".join(words[:budget]).rstrip(",;:")
+            if not clipped.endswith((".", "!", "?")):
+                clipped += "."
+            return clipped
+
+        budget_each = max(35, max_words // max(len(parts), 1))
+        parts = [_clip(p, budget_each) for p in parts]
+        joined = "\n\n".join(parts)
+        words = joined.split()
+        if len(words) > max_words:
+            joined = " ".join(words[:max_words]).rstrip(",;:")
+            if not joined.endswith((".", "!", "?")):
+                joined += "."
+        return joined
+
+    def _style_regional_analysis(self, doc: Document) -> None:
+        """CLIENT style: italic blue body under REGIONAL ANALYSIS."""
+        from docx.shared import RGBColor, Pt
+
+        for i, paragraph in enumerate(doc.paragraphs):
+            if paragraph.text.strip().upper() != "REGIONAL ANALYSIS":
+                continue
+            for j in range(i + 1, len(doc.paragraphs)):
+                nxt = doc.paragraphs[j]
+                style_name = (nxt.style.name if nxt.style else "") or ""
+                upper = nxt.text.strip().upper()
+                if "Heading" in style_name or upper in (
+                    "DEMOGRAPHIC ANALYSIS",
+                    "LOCATION SUMMARY",
+                    "PROPERTY SUMMARY",
+                ):
+                    break
+                if not nxt.text.strip():
+                    continue
+                for run in nxt.runs:
+                    run.italic = True
+                    run.font.color.rgb = RGBColor(0x00, 0x70, 0xC0)
+                    run.font.size = Pt(10)
+            break
 
     def _generate_property_summary(self, context: str) -> str:
         """Generate property summary matching the exact format"""
@@ -818,6 +993,15 @@ Start with the line "Sources Used:" then a numbered list "1. ", "2. ", etc. Plai
         property_data.table_values = self.build_bov_dataset(
             lat_f, lng_f, property_data
         )
+        # Rebuild short valuation NOTES after GBA/valuation math is final
+        property_data.reconciliation_notes = self._build_reconciliation_notes(property_data)
+        property_data.table_values["{{reconciliation_notes}}"] = property_data.reconciliation_notes
+        property_data.table_values["{{reconciliation_summary}}"] = (
+            property_data.reconciliation_summary or ""
+        )
+        property_data.table_values["{{sales_conclusion}}"] = (
+            property_data.sales_conclusion or ""
+        )
 
         return property_data
 
@@ -886,11 +1070,22 @@ Start with the line "Sources Used:" then a numbered list "1. ", "2. ", etc. Plai
 
     @staticmethod
     def _to_number(value):
-        """Parse a number from strings like '24,500' or '708711'; None if not numeric."""
+        """Parse a number from strings like '24,500', '708711', or '24500 SF'."""
         if value is None:
             return None
         try:
-            return float(str(value).replace(",", "").replace("$", "").strip())
+            text = str(value).strip()
+            if not text:
+                return None
+            # Strip currency / area unit suffixes users often type into GBA
+            text = text.replace("$", "").replace(",", "")
+            for suffix in (
+                "sq. ft.", "sq ft", "sqft", "s.f.", "sf", "acres", "acre", "gba",
+            ):
+                if text.lower().endswith(suffix):
+                    text = text[: -len(suffix)].strip()
+                    break
+            return float(text)
         except (TypeError, ValueError):
             return None
 
@@ -899,8 +1094,9 @@ Start with the line "Sources Used:" then a numbered list "1. ", "2. ", etc. Plai
         prompt = f"""
         Generate realistic current demographic, employment, and valuation data for a {property_type}
         property in {county}, {state}. Base values on plausible US Census, Esri, and BLS figures.
-        Use the most recent years available ({datetime.now().year - 5} through {datetime.now().year}) for
-        employment_history — never use 2010-2019 ranges.
+        Use exactly 10 consecutive years ending with the most recent available year
+        (e.g. {datetime.now().year - 9}–{datetime.now().year}) for employment_history —
+        never leave gaps and never use a static 2010-2019 sample.
 
         Return ONLY valid JSON with this exact structure (numbers as plain integers/decimals,
         no commas, no $ signs):
@@ -929,33 +1125,90 @@ Start with the line "Sources Used:" then a numbered list "1. ", "2. ", etc. Plai
             "renter": {{"us": 35.0, "state": 37.4, "county": 49.2}}
           }},
           "rings": {{
-            "1": {{"pop_2024": 13000, "pop_2029": 13100, "hh_2024": 4600, "hh_2029": 4800, "avg_hh_income": 150000, "median_hh_income": 120000, "per_capita_income": 65000, "owner_pct": 60.5, "renter_pct": 39.5}},
-            "3": {{"pop_2024": 95000, "pop_2029": 96000, "hh_2024": 39000, "hh_2029": 42000, "avg_hh_income": 140000, "median_hh_income": 99000, "per_capita_income": 58000, "owner_pct": 41.7, "renter_pct": 58.3}},
-            "5": {{"pop_2024": 218000, "pop_2029": 222000, "hh_2024": 86000, "hh_2029": 93000, "avg_hh_income": 140000, "median_hh_income": 103000, "per_capita_income": 55000, "owner_pct": 46.1, "renter_pct": 53.9}}
+            "1": {{
+              "pop_2010": 11800, "pop_2020": 13500, "pop_2024": 13200, "pop_2029": 13100,
+              "hh_2010": 4300, "hh_2020": 4500, "hh_2024": 4600, "hh_2029": 4800,
+              "avg_hh_income": 150000, "avg_hh_income_2029": 152000,
+              "median_hh_income": 120000, "median_hh_income_2029": 122000,
+              "per_capita_income": 65000, "per_capita_income_2029": 66000,
+              "owner_pct": 60.5, "renter_pct": 39.5,
+              "avg_home_value": 550000, "median_home_value": 520000,
+              "inc_lt_15k": 180, "inc_15_25": 150, "inc_25_35": 200, "inc_35_50": 350,
+              "inc_50_75": 550, "inc_75_100": 480, "inc_100_150": 900, "inc_150_200": 520, "inc_200_plus": 1270,
+              "built_2020_later": 120, "built_2010_2019": 480, "built_2000_2009": 620, "built_1990_1999": 540,
+              "built_1980_1989": 700, "built_1970_1979": 650, "built_1960_1969": 480, "built_1950_1959": 390,
+              "built_1940_1949": 140, "built_1939_earlier": 150,
+              "units_1_det": 2800, "units_1_att": 220, "units_2": 90, "units_3_4": 180, "units_5_9": 210,
+              "units_10_19": 260, "units_20_49": 240, "units_50_plus": 400, "units_mobile": 40, "units_other": 10
+            }},
+            "3": {{
+              "pop_2010": 78000, "pop_2020": 93000, "pop_2024": 95000, "pop_2029": 96000,
+              "hh_2010": 31500, "hh_2020": 36000, "hh_2024": 39000, "hh_2029": 42000,
+              "avg_hh_income": 140000, "avg_hh_income_2029": 142000,
+              "median_hh_income": 99000, "median_hh_income_2029": 101000,
+              "per_capita_income": 58000, "per_capita_income_2029": 59000,
+              "owner_pct": 41.7, "renter_pct": 58.3,
+              "avg_home_value": 480000, "median_home_value": 450000,
+              "inc_lt_15k": 1800, "inc_15_25": 1600, "inc_25_35": 2200, "inc_35_50": 3600,
+              "inc_50_75": 5200, "inc_75_100": 4500, "inc_100_150": 7800, "inc_150_200": 4200, "inc_200_plus": 8100,
+              "built_2020_later": 1400, "built_2010_2019": 4200, "built_2000_2009": 5100, "built_1990_1999": 4800,
+              "built_1980_1989": 6200, "built_1970_1979": 5800, "built_1960_1969": 4100, "built_1950_1959": 3400,
+              "built_1940_1949": 1200, "built_1939_earlier": 1300,
+              "units_1_det": 22000, "units_1_att": 2100, "units_2": 900, "units_3_4": 1800, "units_5_9": 2400,
+              "units_10_19": 3100, "units_20_49": 2800, "units_50_plus": 4500, "units_mobile": 350, "units_other": 80
+            }},
+            "5": {{
+              "pop_2010": 179000, "pop_2020": 210000, "pop_2024": 218000, "pop_2029": 222000,
+              "hh_2010": 69000, "hh_2020": 80000, "hh_2024": 86000, "hh_2029": 93000,
+              "avg_hh_income": 140000, "avg_hh_income_2029": 143000,
+              "median_hh_income": 103000, "median_hh_income_2029": 105000,
+              "per_capita_income": 55000, "per_capita_income_2029": 56500,
+              "owner_pct": 46.1, "renter_pct": 53.9,
+              "avg_home_value": 460000, "median_home_value": 430000,
+              "inc_lt_15k": 4200, "inc_15_25": 3800, "inc_25_35": 5100, "inc_35_50": 8200,
+              "inc_50_75": 11800, "inc_75_100": 10200, "inc_100_150": 16800, "inc_150_200": 9200, "inc_200_plus": 16900,
+              "built_2020_later": 3200, "built_2010_2019": 9800, "built_2000_2009": 11800, "built_1990_1999": 11000,
+              "built_1980_1989": 14200, "built_1970_1979": 13200, "built_1960_1969": 9500, "built_1950_1959": 7800,
+              "built_1940_1949": 2800, "built_1939_earlier": 3000,
+              "units_1_det": 52000, "units_1_att": 4800, "units_2": 2100, "units_3_4": 4200, "units_5_9": 5600,
+              "units_10_19": 7200, "units_20_49": 6500, "units_50_plus": 10500, "units_mobile": 900, "units_other": 180
+            }}
           }},
           "employment": {{
             "total_employment": {{"us": 161000000, "state": 14500000, "county": 1350000}},
             "unemployment_rate": {{"us": 4.1, "state": 4.0, "county": 3.8}}
           }},
           "employment_history": [
-            {{"year": 2020, "state_emp": 12500000, "state_emp_yoy": -2.1, "state_unemp": 6.8,
-              "county_emp": 1200000, "county_emp_yoy": -1.9, "county_unemp": 6.5,
-              "us_emp": 147000000, "us_unemp": 8.1}},
-            {{"year": 2021, "state_emp": 12800000, "state_emp_yoy": 2.4, "state_unemp": 5.4,
-              "county_emp": 1230000, "county_emp_yoy": 2.5, "county_unemp": 5.1,
-              "us_emp": 150000000, "us_unemp": 5.4}},
-            {{"year": 2022, "state_emp": 13100000, "state_emp_yoy": 2.3, "state_unemp": 4.0,
-              "county_emp": 1260000, "county_emp_yoy": 2.4, "county_unemp": 3.8,
+            {{"year": 2016, "state_emp": 11800000, "state_emp_yoy": null, "state_unemp": 4.6,
+              "county_emp": 1120000, "county_emp_yoy": null, "county_unemp": 4.0,
+              "us_emp": 144000000, "us_unemp": 4.9}},
+            {{"year": 2017, "state_emp": 12050000, "state_emp_yoy": 2.1, "state_unemp": 4.3,
+              "county_emp": 1145000, "county_emp_yoy": 2.2, "county_unemp": 3.8,
+              "us_emp": 146500000, "us_unemp": 4.4}},
+            {{"year": 2018, "state_emp": 12300000, "state_emp_yoy": 2.1, "state_unemp": 3.9,
+              "county_emp": 1170000, "county_emp_yoy": 2.2, "county_unemp": 3.6,
+              "us_emp": 149000000, "us_unemp": 3.9}},
+            {{"year": 2019, "state_emp": 12550000, "state_emp_yoy": 2.0, "state_unemp": 3.5,
+              "county_emp": 1195000, "county_emp_yoy": 2.1, "county_unemp": 3.4,
+              "us_emp": 151000000, "us_unemp": 3.7}},
+            {{"year": 2020, "state_emp": 12200000, "state_emp_yoy": -2.8, "state_unemp": 7.6,
+              "county_emp": 1160000, "county_emp_yoy": -2.9, "county_unemp": 7.3,
+              "us_emp": 142000000, "us_unemp": 8.1}},
+            {{"year": 2021, "state_emp": 12600000, "state_emp_yoy": 3.3, "state_unemp": 5.7,
+              "county_emp": 1200000, "county_emp_yoy": 3.4, "county_unemp": 5.4,
+              "us_emp": 148000000, "us_unemp": 5.4}},
+            {{"year": 2022, "state_emp": 13000000, "state_emp_yoy": 3.2, "state_unemp": 4.0,
+              "county_emp": 1240000, "county_emp_yoy": 3.3, "county_unemp": 3.8,
               "us_emp": 153000000, "us_unemp": 3.6}},
-            {{"year": 2023, "state_emp": 13350000, "state_emp_yoy": 1.9, "state_unemp": 3.8,
-              "county_emp": 1285000, "county_emp_yoy": 2.0, "county_unemp": 3.6,
+            {{"year": 2023, "state_emp": 13300000, "state_emp_yoy": 2.3, "state_unemp": 3.9,
+              "county_emp": 1270000, "county_emp_yoy": 2.4, "county_unemp": 3.7,
               "us_emp": 155500000, "us_unemp": 3.6}},
-            {{"year": 2024, "state_emp": 13580000, "state_emp_yoy": 1.7, "state_unemp": 3.9,
-              "county_emp": 1302000, "county_emp_yoy": 1.3, "county_unemp": 3.7,
-              "us_emp": 157800000, "us_unemp": 3.9}},
-            {{"year": 2025, "state_emp": 13750000, "state_emp_yoy": 1.3, "state_unemp": 3.8,
-              "county_emp": 1318000, "county_emp_yoy": 1.2, "county_unemp": 3.5,
-              "us_emp": 159500000, "us_unemp": 4.0}}
+            {{"year": 2024, "state_emp": 13600000, "state_emp_yoy": 2.3, "state_unemp": 4.0,
+              "county_emp": 1300000, "county_emp_yoy": 2.4, "county_unemp": 3.8,
+              "us_emp": 158000000, "us_unemp": 3.9}},
+            {{"year": 2025, "state_emp": 13850000, "state_emp_yoy": 1.8, "state_unemp": 3.9,
+              "county_emp": 1325000, "county_emp_yoy": 1.9, "county_unemp": 3.6,
+              "us_emp": 160000000, "us_unemp": 4.0}}
           ],
           "valuation": {{
             "price_psf": 265.00, "building_sf": 24500,
@@ -983,11 +1236,56 @@ Start with the line "Sources Used:" then a numbered list "1. ", "2. ", etc. Plai
         """Replace AI ring numbers with real Esri values where present."""
         dataset.setdefault("rings", {})
         esri_map = {
+            "pop_2010": ("TOTPOP10", "POP10"),
+            "pop_2020": ("TOTPOP20", "POP20", "TOTPOP_CY_PREV"),
             "pop_2024": ("TOTPOP_CY", "TOTPOP_FY"),
+            "pop_2029": ("TOTPOP_FY",),
+            "hh_2010": ("TOTHH10", "HH10"),
+            "hh_2020": ("TOTHH20", "HH20"),
             "hh_2024": ("TOTHH_CY",),
+            "hh_2029": ("TOTHH_FY",),
             "avg_hh_income": ("AVGHINC_CY", "AVGHHINC_CY"),
+            "avg_hh_income_2029": ("AVGHINC_FY", "AVGHHINC_FY"),
             "median_hh_income": ("MEDHINC_CY",),
+            "median_hh_income_2029": ("MEDHINC_FY",),
             "per_capita_income": ("PCI_CY",),
+            "per_capita_income_2029": ("PCI_FY",),
+            "owner_pct": ("OWNERPCT_CY", "OWNER_CY"),
+            "renter_pct": ("RENTERPCT_CY", "RENTER_CY"),
+            "avg_home_value": ("AVGVAL_CY", "AVGHOMEVAL_CY"),
+            "median_home_value": ("MEDVAL_CY", "MEDHOMEVAL_CY"),
+            # Households by income (counts)
+            "inc_lt_15k": ("HINC0_CY", "ACSINC0"),
+            "inc_15_25": ("HINC15_CY", "ACSINC15"),
+            "inc_25_35": ("HINC25_CY", "ACSINC25"),
+            "inc_35_50": ("HINC35_CY", "ACSINC35"),
+            "inc_50_75": ("HINC50_CY", "ACSINC50"),
+            "inc_75_100": ("HINC75_CY", "ACSINC75"),
+            "inc_100_150": ("HINC100_CY", "ACSINC100"),
+            "inc_150_200": ("HINC150_CY", "ACSINC150"),
+            "inc_200_plus": ("HINC200_CY", "ACSINC200"),
+            # Year built
+            "built_2020_later": ("ACSYB2020", "YB2020_CY"),
+            "built_2010_2019": ("ACSYB2010", "YB2010_CY"),
+            "built_2000_2009": ("ACSYB2000", "YB2000_CY"),
+            "built_1990_1999": ("ACSYB1990", "YB1990_CY"),
+            "built_1980_1989": ("ACSYB1980", "YB1980_CY"),
+            "built_1970_1979": ("ACSYB1970", "YB1970_CY"),
+            "built_1960_1969": ("ACSYB1960", "YB1960_CY"),
+            "built_1950_1959": ("ACSYB1950", "YB1950_CY"),
+            "built_1940_1949": ("ACSYB1940", "YB1940_CY"),
+            "built_1939_earlier": ("ACSYB1939", "YB1939_CY"),
+            # Units in structure
+            "units_1_det": ("ACSOCCDET", "UNITS1DET_CY"),
+            "units_1_att": ("ACSOCCATT", "UNITS1ATT_CY"),
+            "units_2": ("ACSOCC2", "UNITS2_CY"),
+            "units_3_4": ("ACSOCC3", "UNITS3_CY"),
+            "units_5_9": ("ACSOCC5", "UNITS5_CY"),
+            "units_10_19": ("ACSOCC10", "UNITS10_CY"),
+            "units_20_49": ("ACSOCC20", "UNITS20_CY"),
+            "units_50_plus": ("ACSOCC50", "UNITS50_CY"),
+            "units_mobile": ("ACSOCCMOB", "UNITSMH_CY"),
+            "units_other": ("ACSOCCOTH", "UNITSOTH_CY"),
         }
         for radius, attributes in rings.items():
             target = dataset["rings"].setdefault(radius, {})
@@ -996,9 +1294,172 @@ Start with the line "Sources Used:" then a numbered list "1. ", "2. ", etc. Plai
                     if attributes.get(key) is not None:
                         target[field_name] = attributes[key]
                         break
+        self._enrich_ring_derived_fields(dataset)
+
+    def _enrich_ring_derived_fields(self, dataset: Dict) -> None:
+        """Fill missing historical/forecast ring fields and % change metrics."""
+        raw_rings = dataset.get("rings") or {}
+        # AI sometimes returns int keys (1) instead of strings ("1")
+        rings = {str(k): (v if isinstance(v, dict) else {}) for k, v in raw_rings.items()}
+        dataset["rings"] = rings
+        for r in ("1", "3", "5"):
+            ring = rings.setdefault(r, {})
+
+            # Backfill historical years from current when Esri only returned CY values
+            pop_2024 = self._to_number(ring.get("pop_2024"))
+            pop_2029 = self._to_number(ring.get("pop_2029"))
+            if pop_2024 is not None:
+                if self._to_number(ring.get("pop_2020")) is None:
+                    ring["pop_2020"] = round(pop_2024 / 1.03)
+                if self._to_number(ring.get("pop_2010")) is None:
+                    ring["pop_2010"] = round(self._to_number(ring["pop_2020"]) / 1.15)
+            if pop_2024 is not None and pop_2029 is None:
+                ring["pop_2029"] = round(pop_2024 * 1.02)
+
+            hh_2024 = self._to_number(ring.get("hh_2024"))
+            hh_2029 = self._to_number(ring.get("hh_2029"))
+            if hh_2024 is not None:
+                if self._to_number(ring.get("hh_2020")) is None:
+                    ring["hh_2020"] = round(hh_2024 / 1.04)
+                if self._to_number(ring.get("hh_2010")) is None:
+                    ring["hh_2010"] = round(self._to_number(ring["hh_2020"]) / 1.12)
+            if hh_2024 is not None and hh_2029 is None:
+                ring["hh_2029"] = round(hh_2024 * 1.05)
+
+            for base_key, fy_key, growth in (
+                ("avg_hh_income", "avg_hh_income_2029", 1.02),
+                ("median_hh_income", "median_hh_income_2029", 1.02),
+                ("per_capita_income", "per_capita_income_2029", 1.02),
+            ):
+                base = self._to_number(ring.get(base_key))
+                if base is not None and self._to_number(ring.get(fy_key)) is None:
+                    ring[fy_key] = round(base * growth)
+
+            if self._to_number(ring.get("avg_home_value")) is None:
+                med = self._to_number(ring.get("median_home_value"))
+                if med is not None:
+                    ring["avg_home_value"] = round(med * 1.08)
+                else:
+                    # Rough local estimate from median HH income when Esri has no value vars
+                    med_inc = self._to_number(ring.get("median_hh_income"))
+                    if med_inc is not None:
+                        ring["median_home_value"] = round(med_inc * 3.5)
+                        ring["avg_home_value"] = round(ring["median_home_value"] * 1.08)
+            if self._to_number(ring.get("median_home_value")) is None:
+                avg = self._to_number(ring.get("avg_home_value"))
+                if avg is not None:
+                    ring["median_home_value"] = round(avg / 1.08)
+
+            if self._to_number(ring.get("owner_pct")) is None:
+                ring["owner_pct"] = 50.0
+            if self._to_number(ring.get("renter_pct")) is None:
+                owner = self._to_number(ring.get("owner_pct")) or 50.0
+                ring["renter_pct"] = round(100.0 - owner, 1)
+
+            # Esri OWNER_CY / RENTER_CY are household counts — convert to %
+            owner = self._to_number(ring.get("owner_pct"))
+            renter = self._to_number(ring.get("renter_pct"))
+            hh_now = self._to_number(ring.get("hh_2024"))
+            if (
+                owner is not None
+                and renter is not None
+                and owner > 100
+                and renter > 100
+            ):
+                total = owner + renter
+                if total > 0:
+                    ring["owner_pct"] = round(owner / total * 100, 1)
+                    ring["renter_pct"] = round(renter / total * 100, 1)
+            else:
+                if owner is not None and owner > 100 and hh_now:
+                    ring["owner_pct"] = round(owner / hh_now * 100, 1)
+                    owner = ring["owner_pct"]
+                if renter is not None and renter > 100 and hh_now:
+                    ring["renter_pct"] = round(renter / hh_now * 100, 1)
+                    renter = ring["renter_pct"]
+                owner = self._to_number(ring.get("owner_pct"))
+                renter = self._to_number(ring.get("renter_pct"))
+                if owner is not None and (renter is None or renter > 100):
+                    ring["renter_pct"] = round(max(0.0, 100.0 - float(owner)), 1)
+
+            # Fill income / year-built / structure counts when missing (scale by HH)
+            self._ensure_ring_distribution_counts(ring)
+
+            # % changes used by the LOCAL AREA DEMOGRAPHICS table
+            ring["pop_chg_2010_2020"] = self._pct_change(ring.get("pop_2010"), ring.get("pop_2020"))
+            ring["pop_chg_2020_2024"] = self._pct_change(ring.get("pop_2020"), ring.get("pop_2024"))
+            ring["pop_chg_2024_2029"] = self._pct_change(ring.get("pop_2024"), ring.get("pop_2029"))
+            ring["hh_chg_2010_2020"] = self._pct_change(ring.get("hh_2010"), ring.get("hh_2020"))
+            ring["hh_chg_2020_2024"] = self._pct_change(ring.get("hh_2020"), ring.get("hh_2024"))
+            ring["hh_chg_2024_2029"] = self._pct_change(ring.get("hh_2024"), ring.get("hh_2029"))
+            ring["avg_inc_chg"] = self._pct_change(ring.get("avg_hh_income"), ring.get("avg_hh_income_2029"))
+            ring["med_inc_chg"] = self._pct_change(ring.get("median_hh_income"), ring.get("median_hh_income_2029"))
+            ring["pci_chg"] = self._pct_change(ring.get("per_capita_income"), ring.get("per_capita_income_2029"))
+
+    def _ensure_ring_distribution_counts(self, ring: Dict) -> None:
+        """Ensure income / year-built / units-in-structure counts exist for the table."""
+        hh = self._to_number(ring.get("hh_2024")) or self._to_number(ring.get("hh_2020")) or 5000
+        hu = max(hh, round(hh * 1.05))  # housing units slightly above HH
+
+        income_shares = (
+            ("inc_lt_15k", 0.06),
+            ("inc_15_25", 0.05),
+            ("inc_25_35", 0.07),
+            ("inc_35_50", 0.10),
+            ("inc_50_75", 0.14),
+            ("inc_75_100", 0.12),
+            ("inc_100_150", 0.18),
+            ("inc_150_200", 0.10),
+            ("inc_200_plus", 0.18),
+        )
+        built_shares = (
+            ("built_2020_later", 0.03),
+            ("built_2010_2019", 0.10),
+            ("built_2000_2009", 0.12),
+            ("built_1990_1999", 0.11),
+            ("built_1980_1989", 0.14),
+            ("built_1970_1979", 0.13),
+            ("built_1960_1969", 0.10),
+            ("built_1950_1959", 0.09),
+            ("built_1940_1949", 0.04),
+            ("built_1939_earlier", 0.04),
+        )
+        units_shares = (
+            ("units_1_det", 0.55),
+            ("units_1_att", 0.05),
+            ("units_2", 0.02),
+            ("units_3_4", 0.04),
+            ("units_5_9", 0.05),
+            ("units_10_19", 0.06),
+            ("units_20_49", 0.05),
+            ("units_50_plus", 0.10),
+            ("units_mobile", 0.015),
+            ("units_other", 0.005),
+        )
+        for key, share in income_shares:
+            if self._to_number(ring.get(key)) is None:
+                ring[key] = max(0, round(hh * share))
+        for key, share in built_shares:
+            if self._to_number(ring.get(key)) is None:
+                ring[key] = max(0, round(hu * share))
+        for key, share in units_shares:
+            if self._to_number(ring.get(key)) is None:
+                ring[key] = max(0, round(hu * share))
+
+    @staticmethod
+    def _pct_change(old, new):
+        try:
+            old_f = float(str(old).replace(",", "").replace("$", "").replace("%", ""))
+            new_f = float(str(new).replace(",", "").replace("$", "").replace("%", ""))
+            if old_f == 0:
+                return None
+            return round((new_f - old_f) / old_f * 100, 1)
+        except (TypeError, ValueError):
+            return None
 
     def _format_bov_placeholders(self, dataset: Dict, property_data: "PropertyReportData") -> Dict[str, str]:
         """Flatten the dataset dict into {{placeholder}} -> formatted string values."""
+        self._enrich_ring_derived_fields(dataset)
 
         def num(value, decimals=0):
             if value is None or value == "":
@@ -1057,15 +1518,47 @@ Start with the line "Sources Used:" then a numbered list "1. ", "2. ", etc. Plai
         rings = dataset.get("rings", {})
         for r in ("1", "3", "5"):
             ring = rings.get(r, {})
+            v[f"{{{{r{r}_pop_2010}}}}"] = num(ring.get("pop_2010"))
+            v[f"{{{{r{r}_pop_2020}}}}"] = num(ring.get("pop_2020"))
             v[f"{{{{r{r}_pop_2024}}}}"] = num(ring.get("pop_2024"))
             v[f"{{{{r{r}_pop_2029}}}}"] = num(ring.get("pop_2029"))
+            v[f"{{{{r{r}_pop_chg_2010_2020}}}}"] = pct(ring.get("pop_chg_2010_2020"))
+            v[f"{{{{r{r}_pop_chg_2020_2024}}}}"] = pct(ring.get("pop_chg_2020_2024"))
+            v[f"{{{{r{r}_pop_chg_2024_2029}}}}"] = pct(ring.get("pop_chg_2024_2029"))
+
+            v[f"{{{{r{r}_hh_2010}}}}"] = num(ring.get("hh_2010"))
+            v[f"{{{{r{r}_hh_2020}}}}"] = num(ring.get("hh_2020"))
             v[f"{{{{r{r}_hh_2024}}}}"] = num(ring.get("hh_2024"))
             v[f"{{{{r{r}_hh_2029}}}}"] = num(ring.get("hh_2029"))
+            v[f"{{{{r{r}_hh_chg_2010_2020}}}}"] = pct(ring.get("hh_chg_2010_2020"))
+            v[f"{{{{r{r}_hh_chg_2020_2024}}}}"] = pct(ring.get("hh_chg_2020_2024"))
+            v[f"{{{{r{r}_hh_chg_2024_2029}}}}"] = pct(ring.get("hh_chg_2024_2029"))
+
             v[f"{{{{r{r}_avg_hh_income}}}}"] = money(ring.get("avg_hh_income"))
+            v[f"{{{{r{r}_avg_hh_income_2029}}}}"] = money(ring.get("avg_hh_income_2029"))
+            v[f"{{{{r{r}_avg_inc_chg}}}}"] = pct(ring.get("avg_inc_chg"))
             v[f"{{{{r{r}_median_hh_income}}}}"] = money(ring.get("median_hh_income"))
+            v[f"{{{{r{r}_median_hh_income_2029}}}}"] = money(ring.get("median_hh_income_2029"))
+            v[f"{{{{r{r}_med_inc_chg}}}}"] = pct(ring.get("med_inc_chg"))
             v[f"{{{{r{r}_per_capita_income}}}}"] = money(ring.get("per_capita_income"))
+            v[f"{{{{r{r}_per_capita_income_2029}}}}"] = money(ring.get("per_capita_income_2029"))
+            v[f"{{{{r{r}_pci_chg}}}}"] = pct(ring.get("pci_chg"))
+
             v[f"{{{{r{r}_owner_pct}}}}"] = pct(ring.get("owner_pct"))
             v[f"{{{{r{r}_renter_pct}}}}"] = pct(ring.get("renter_pct"))
+            v[f"{{{{r{r}_avg_home_value}}}}"] = money(ring.get("avg_home_value"))
+            v[f"{{{{r{r}_median_home_value}}}}"] = money(ring.get("median_home_value"))
+
+            for key in (
+                "inc_lt_15k", "inc_15_25", "inc_25_35", "inc_35_50", "inc_50_75",
+                "inc_75_100", "inc_100_150", "inc_150_200", "inc_200_plus",
+                "built_2020_later", "built_2010_2019", "built_2000_2009", "built_1990_1999",
+                "built_1980_1989", "built_1970_1979", "built_1960_1969", "built_1950_1959",
+                "built_1940_1949", "built_1939_earlier",
+                "units_1_det", "units_1_att", "units_2", "units_3_4", "units_5_9",
+                "units_10_19", "units_20_49", "units_50_plus", "units_mobile", "units_other",
+            ):
+                v[f"{{{{r{r}_{key}}}}}"] = num(ring.get(key))
 
         emp = dataset.get("employment", {})
         for g in geos:
@@ -1086,6 +1579,10 @@ Start with the line "Sources Used:" then a numbered list "1. ", "2. ", etc. Plai
         v["{{regional_analysis}}"] = property_data.regional_analysis
         v["{{sales_conclusion}}"] = property_data.sales_conclusion
         v["{{reconciliation_summary}}"] = property_data.reconciliation_summary
+        v["{{reconciliation_notes}}"] = (
+            property_data.reconciliation_notes
+            or self._build_reconciliation_notes(property_data)
+        )
         return v
 
     @staticmethod
@@ -1099,7 +1596,14 @@ Start with the line "Sources Used:" then a numbered list "1. ", "2. ", etc. Plai
         return Paragraph(new_p, paragraph._parent)
 
     def _insert_comparables(self, doc: Document, comps: List[Any]) -> None:
-        """Insert extracted comparable sales after the PROPERTY COMPARABLES heading."""
+        """Insert CoStar comparable pages after PROPERTY COMPARABLES.
+
+        Unique PDF page renders are inserted (deduped) and scaled so ~2 cards
+        fit on a Word page when the source page is a single trimmed card.
+        """
+        from docx.shared import Inches, Pt
+        from docx.enum.text import WD_ALIGN_PARAGRAPH
+
         heading_idx = None
         for i, p in enumerate(doc.paragraphs):
             if "PROPERTY COMPARABLES" in p.text.upper():
@@ -1111,11 +1615,45 @@ Start with the line "Sources Used:" then a numbered list "1. ", "2. ", etc. Plai
         anchor = doc.paragraphs[heading_idx]
         sorted_comps = sorted(comps, key=lambda c: getattr(c, "comp_number", 0))[:6]
 
+        # One image per unique CoStar page (avoids duplicating 2-card pages)
+        seen_paths = set()
+        page_images = []
+        for comp in sorted_comps:
+            image_path = (
+                getattr(comp, "page_image_path", None)
+                or getattr(comp, "image_path", None)
+            )
+            if not image_path or not os.path.exists(image_path):
+                continue
+            if image_path in seen_paths:
+                continue
+            seen_paths.add(image_path)
+            page_images.append(image_path)
+
+        if page_images:
+            for image_path in page_images:
+                img_p = self._insert_paragraph_after(anchor)
+                img_p.paragraph_format.space_before = Pt(0)
+                img_p.paragraph_format.space_after = Pt(4)
+                img_p.paragraph_format.line_spacing = 1.0
+                img_p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                try:
+                    width_in, height_in = self._comp_image_display_size(image_path)
+                    # Pass only width — Word keeps aspect; height is pre-capped for 2/page
+                    img_p.add_run().add_picture(image_path, width=Inches(width_in))
+                    anchor = img_p
+                except Exception as exc:
+                    logger.warning("Could not insert comp page image: %s", exc)
+            logger.info(
+                "Inserted %d unique CoStar page image(s) for comps", len(page_images)
+            )
+            return
+
+        # Fallback text details when no page images
         for comp in sorted_comps:
             title_p = self._insert_paragraph_after(anchor)
-            run = title_p.add_run(
-                f"Comparable {getattr(comp, 'comp_number', '')}: {getattr(comp, 'property_name', 'Property')}"
-            )
+            name = getattr(comp, "property_name", "") or "Property"
+            run = title_p.add_run(name)
             run.bold = True
             anchor = title_p
 
@@ -1123,7 +1661,12 @@ Start with the line "Sources Used:" then a numbered list "1. ", "2. ", etc. Plai
             for label, val in (
                 ("Address", getattr(comp, "address", "")),
                 ("Primary Use", getattr(comp, "primary_use", "")),
-                ("Market / Submarket", f"{getattr(comp, 'market', '')} / {getattr(comp, 'sub_market', '')}".strip(" /")),
+                (
+                    "Market / Submarket",
+                    f"{getattr(comp, 'market', '')} / {getattr(comp, 'sub_market', '')}".strip(
+                        " /"
+                    ),
+                ),
                 ("Comp SF", getattr(comp, "comp_sf", "")),
                 ("Acres", getattr(comp, "acres", "")),
                 ("Sale Price", getattr(comp, "sale_price", "")),
@@ -1136,24 +1679,63 @@ Start with the line "Sources Used:" then a numbered list "1. ", "2. ", etc. Plai
                 if val and str(val).strip():
                     details.append(f"{label}: {val}")
 
-            if details:
+            for line in details:
                 detail_p = self._insert_paragraph_after(anchor)
-                detail_p.add_run("\n".join(details))
+                detail_p.add_run(line)
                 anchor = detail_p
-
-            image_path = getattr(comp, "image_path", None)
-            if image_path and os.path.exists(image_path):
-                img_p = self._insert_paragraph_after(anchor)
-                try:
-                    img_p.add_run().add_picture(image_path, width=Inches(5.5))
-                    anchor = img_p
-                except Exception as exc:
-                    logger.warning("Could not insert comp image: %s", exc)
 
         logger.info("Inserted %d comparable properties into BOV report", len(sorted_comps))
 
+    @staticmethod
+    def _comp_image_display_size(image_path: str) -> Tuple[float, float]:
+        """Size CoStar images for readability first, then pack when they still fit.
+
+        Land Comp Summary cards are landscape: height-capping to force 2/page made
+        them ~5\" wide with large side margins (tiny vs native CoStar cards). Prefer
+        full content width (~6.5\") so text stays legible; still cap height when that
+        does not force a narrow width.
+        """
+        max_width = 6.5
+        # Soft cap — two short cards can still stack; tall pages stay full-width
+        soft_max_height = 4.95
+        min_readable_width = 6.0
+        try:
+            from PIL import Image
+
+            with Image.open(image_path) as im:
+                w, h = im.size
+            if not w or not h:
+                return max_width, soft_max_height
+            aspect = h / float(w)
+
+            # Start at full content width
+            width = max_width
+            height = width * aspect
+
+            if height > soft_max_height:
+                capped_h = soft_max_height
+                capped_w = capped_h / aspect
+                # Only shrink if we stay near full width; otherwise keep full width
+                # (one large card beats two illegible miniatures)
+                if capped_w >= min_readable_width:
+                    width, height = capped_w, capped_h
+                else:
+                    width = max_width
+                    height = width * aspect
+
+            return round(width, 3), round(height, 3)
+        except Exception:
+            return max_width, soft_max_height
+
     def _fill_employment_table(self, doc: Document, dataset: Dict, county: str, state: str) -> None:
-        """Replace legacy 2010-2019 employment table years with recent data."""
+        """Fill the employment table with recent-year history while keeping compact cell styles.
+
+        The template ships with 2010-2019 sample rows. We remap those 10 data rows to the
+        latest history years and update values by editing existing runs (never cell.text=,
+        which drops TableText/8pt styling and makes years wrap in the narrow Year column).
+        """
+        from docx.oxml.ns import qn
+
         if len(doc.tables) < 10:
             return
         history = dataset.get("employment_history") or []
@@ -1161,42 +1743,209 @@ Start with the line "Sources Used:" then a numbered list "1. ", "2. ", etc. Plai
             return
 
         table = doc.tables[9]
-        year_rows = {int(r["year"]): r for r in history if r.get("year")}
-        year_shift = {2010 + i: 2020 + i for i in range(10)}
+        rows_data = sorted(
+            [r for r in history if r.get("year")],
+            key=lambda r: int(r["year"]),
+        )
+        if not rows_data:
+            return
+        rows_data = rows_data[-10:]
 
         def fmt_num(n):
             try:
                 return f"{int(round(float(n))):,}"
             except (TypeError, ValueError):
-                return str(n)
+                return "—"
 
         def fmt_pct(n):
+            if n is None or n == "":
+                return None
             try:
                 return f"{float(n):.1f}%"
             except (TypeError, ValueError):
-                return str(n)
+                return "—"
 
-        for row in table.rows:
-            for cell in row.cells:
-                text = cell.text.strip()
-                if re.fullmatch(r"20\d{2}", text):
-                    yr = int(text)
-                    target_year = year_shift.get(yr, yr)
-                    if target_year in year_rows:
-                        cell.text = str(target_year)
-                    elif yr in year_rows:
-                        cell.text = str(yr)
+        def set_tc_text(tc, value: str) -> None:
+            """Write text into a w:tc while preserving compact TableText/8pt formatting.
 
-        # Update header to reflect data era
+            Never use cell.text= — that drops pStyle/sz and makes years wrap in the
+            narrow Year column (715 dxa), producing the tall rows seen in reports.
+            """
+            from docx.oxml import OxmlElement
+
+            text = "" if value is None else str(value)
+            paragraphs = tc.findall(qn("w:p"))
+            if not paragraphs:
+                return
+            p0 = paragraphs[0]
+
+            # Keep / restore TableText so row height stays compact
+            pPr = p0.find(qn("w:pPr"))
+            if pPr is None:
+                pPr = OxmlElement("w:pPr")
+                p0.insert(0, pPr)
+            pStyle = pPr.find(qn("w:pStyle"))
+            if pStyle is None:
+                pStyle = OxmlElement("w:pStyle")
+                pPr.insert(0, pStyle)
+            pStyle.set(qn("w:val"), "TableText")
+
+            runs = p0.findall(qn("w:r"))
+            if not runs:
+                run = OxmlElement("w:r")
+                p0.append(run)
+                runs = [run]
+
+            r0 = runs[0]
+            rPr = r0.find(qn("w:rPr"))
+            if rPr is None:
+                rPr = OxmlElement("w:rPr")
+                r0.insert(0, rPr)
+            sz = rPr.find(qn("w:sz"))
+            if sz is None:
+                sz = OxmlElement("w:sz")
+                rPr.append(sz)
+            sz.set(qn("w:val"), "16")  # 8pt — matches template data rows
+            szCs = rPr.find(qn("w:szCs"))
+            if szCs is None:
+                szCs = OxmlElement("w:szCs")
+                rPr.append(szCs)
+            szCs.set(qn("w:val"), "16")
+
+            t_nodes = list(r0.iter(qn("w:t")))
+            if t_nodes:
+                t_nodes[0].text = text
+                if text.startswith(" ") or text.endswith(" "):
+                    t_nodes[0].set(qn("xml:space"), "preserve")
+                for t in t_nodes[1:]:
+                    t.text = ""
+            else:
+                t = OxmlElement("w:t")
+                t.text = text
+                r0.append(t)
+
+            for run in runs[1:]:
+                for t in run.iter(qn("w:t")):
+                    t.text = ""
+            for extra in paragraphs[1:]:
+                for t in extra.iter(qn("w:t")):
+                    t.text = ""
+
+        data_row_indices = []
+        for ri, row in enumerate(table.rows):
+            tcs = row._tr.findall(qn("w:tc"))
+            if not tcs:
+                continue
+            year_txt = "".join(t.text or "" for t in tcs[0].iter(qn("w:t"))).strip()
+            if re.fullmatch(r"20\d{2}", year_txt):
+                data_row_indices.append(ri)
+
+        for idx, ri in enumerate(data_row_indices):
+            if idx >= len(rows_data):
+                break
+            rec = rows_data[idx]
+            tcs = table.rows[ri]._tr.findall(qn("w:tc"))
+            state_yoy = fmt_pct(rec.get("state_emp_yoy"))
+            county_yoy = fmt_pct(rec.get("county_emp_yoy"))
+            if idx == 0:
+                if state_yoy is None:
+                    state_yoy = "no data"
+                if county_yoy is None:
+                    county_yoy = "no data"
+            values = [
+                str(int(rec["year"])),
+                fmt_num(rec.get("state_emp")),
+                state_yoy if state_yoy is not None else "—",
+                fmt_num(rec.get("county_emp")),
+                county_yoy if county_yoy is not None else "—",
+                fmt_pct(rec.get("us_unemp")) or "—",
+                fmt_pct(rec.get("state_unemp")) or "—",
+                fmt_pct(rec.get("county_unemp")) or "—",
+            ]
+            for ci, value in enumerate(values):
+                if ci < len(tcs):
+                    set_tc_text(tcs[ci], value)
+
+        # If history has fewer than 10 years, remove leftover sample year rows
+        # so we don't leave mixed eras (e.g. 2020–2025 then orphaned 2016–2019).
+        if len(rows_data) < len(data_row_indices):
+            for ri in reversed(data_row_indices[len(rows_data) :]):
+                try:
+                    table._tbl.remove(table.rows[ri]._tr)
+                except Exception:
+                    pass
+
+        # Header title — keep existing run formatting
         try:
-            hdr = table.rows[0].cells[0].paragraphs[0]
-            if hdr.text and "2010" in hdr.text:
-                hdr.text = hdr.text.replace("2010-2019", f"2020-{datetime.now().year}")
-                hdr.text = hdr.text.replace("2010", "2020")
+            start_y = int(rows_data[0]["year"])
+            end_y = int(rows_data[-1]["year"])
+            new_title = f"EMPLOYMENT & UNEMPLOYMENT STATISTICS {start_y} – {end_y}"
+            hdr_tc = table.rows[0]._tr.findall(qn("w:tc"))[0]
+            set_tc_text(hdr_tc, new_title)
         except Exception:
             pass
 
-        logger.info("Refreshed employment table with %d recent-year records", len(year_rows))
+        # Geo labels
+        try:
+            for row in table.rows[1:4]:
+                for tc in row._tr.findall(qn("w:tc")):
+                    joined = "".join(t.text or "" for t in tc.iter(qn("w:t")))
+                    if "{{state}}" in joined or "{{county}}" in joined:
+                        replaced = joined.replace("{{state}}", state or "State").replace(
+                            "{{county}}", county or "County"
+                        )
+                        set_tc_text(tc, replaced)
+        except Exception:
+            pass
+
+        logger.info("Filled employment table with %d recent-year records", len(rows_data))
+
+    def _sweep_remaining_placeholders(self, doc: Document, replacements: Dict[str, str]) -> None:
+        """Replace any leftover {{placeholders}} still present in the document XML."""
+        import re
+        from docx.oxml.ns import qn
+
+        pattern = re.compile(r"\{\{[^}]+\}\}")
+        w_t = qn("w:t")
+        replaced = 0
+
+        def process(root):
+            nonlocal replaced
+            if root is None:
+                return
+            # Rebuild paragraph text when placeholder spans multiple w:t nodes
+            for p in root.iter(qn("w:p")):
+                nodes = [n for n in p.iter(w_t) if n.text]
+                if not nodes:
+                    continue
+                joined = "".join(n.text or "" for n in nodes)
+                if "{{" not in joined:
+                    continue
+                new_text = joined
+                for placeholder, value in replacements.items():
+                    if placeholder in new_text:
+                        # Sweep writes into a single w:t — collapse newlines to spaces
+                        # so we never inject soft-break-like gaps into justified text.
+                        safe = value if value is not None else "—"
+                        safe = re.sub(r"\s*\n\s*", " ", str(safe)).strip()
+                        new_text = new_text.replace(placeholder, safe)
+                # Anything still unmatched -> em dash so raw {{...}} never ships
+                new_text, _n = pattern.subn("—", new_text)
+                if new_text != joined:
+                    nodes[0].text = new_text
+                    for n_el in nodes[1:]:
+                        n_el.text = ""
+                    replaced += 1
+
+        process(doc.element.body)
+        for section in doc.sections:
+            for part in (section.header, section.footer):
+                try:
+                    process(part._element)
+                except Exception:
+                    pass
+        if replaced:
+            logger.info("Swept leftover placeholders in %d paragraph(s)", replaced)
 
     def _replace_in_textboxes(self, doc: Document, replacements: Dict[str, str]):
         """Replace placeholders inside text boxes (cover, side bars) and headers/footers.
@@ -1278,8 +2027,7 @@ Start with the line "Sources Used:" then a numbered list "1. ", "2. ", etc. Plai
                 part = doc.part.related_parts.get(rid) if rid else None
                 if part is not None:
                     try:
-                        with open(image_path, "rb") as fh:
-                            part._blob = fh.read()
+                        part._blob = self._image_bytes_for_part(image_path, part)
                         logger.info(f"Swapped template image {matched} -> {image_path}")
                     except Exception as exc:
                         logger.error(f"Image swap failed for {matched}: {exc}")
@@ -1294,6 +2042,30 @@ Start with the line "Sources Used:" then a numbered list "1. ", "2. ", etc. Plai
                 for placeholder in image_map:
                     descr = descr.replace(placeholder, "")
                 el.set("descr", descr)
+
+    @staticmethod
+    def _image_bytes_for_part(image_path: str, part) -> bytes:
+        """Return image bytes matching the template part's format (usually JPEG)."""
+        from io import BytesIO
+
+        raw = Path(image_path).read_bytes()
+        partname = str(getattr(part, "partname", "") or "").lower()
+        wants_jpeg = partname.endswith((".jpg", ".jpeg")) or "image/jpeg" in str(
+            getattr(part, "content_type", "")
+        ).lower()
+
+        is_jpeg = raw[:3] == b"\xff\xd8\xff"
+        if wants_jpeg and not is_jpeg:
+            try:
+                from PIL import Image
+
+                img = Image.open(BytesIO(raw)).convert("RGB")
+                buf = BytesIO()
+                img.save(buf, format="JPEG", quality=90)
+                return buf.getvalue()
+            except Exception as exc:
+                logger.warning("Could not convert %s to JPEG: %s", image_path, exc)
+        return raw
 
     def _replace_image_placeholder(self, doc: Document, placeholder: str, image_path: Optional[str], width_inches: float = 3.0):
         """
@@ -1462,6 +2234,9 @@ Start with the line "Sources Used:" then a numbered list "1. ", "2. ", etc. Plai
         # Merge BOV table values (population, households, rings, employment, valuation)
         if property_data.table_values:
             replacements.update(property_data.table_values)
+            ring_keys = [k for k in property_data.table_values if k.startswith("{{r")]
+            logger.info("Merged %d BOV table placeholders (%d ring fields)",
+                        len(property_data.table_values), len(ring_keys))
         
         # Replace text in all document elements
         self._replace_text_in_document(doc, replacements)
@@ -1469,13 +2244,22 @@ Start with the line "Sources Used:" then a numbered list "1. ", "2. ", etc. Plai
         # Replace placeholders inside text boxes (cover, side bars) and headers/footers
         self._replace_in_textboxes(doc, replacements)
 
-        # Cover/branding images live inside text boxes; subject photo falls back to aerial
-        subject_image = property_data.street_view_image_path or property_data.aerial_image_path
+        # Final sweep: catch any leftover {{placeholders}} (split runs / missed cells)
+        self._sweep_remaining_placeholders(doc, replacements)
+
+        # Justified paragraphs + soft breaks → huge word gaps on short last lines
+        self._fix_justified_soft_breaks(doc)
+
+        # CLIENT look: regional body in italic blue, kept short
+        self._style_regional_analysis(doc)
+
+        # Cover / aerial / subject images live in text boxes (alt-text placeholders).
+        # SUBJECT PHOTOS must be Street View only — never reuse the aerial map.
         self._replace_textbox_images(doc, {
             '{{main_img}}': (property_data.aerial_image_path, 6.0),
             '{{aerial_image}}': (property_data.aerial_image_path, 6.0),
-            '{{Subject_photo}}': (subject_image, 3.5),
-            '{{subject_photo}}': (subject_image, 3.5),
+            '{{Subject_photo}}': (property_data.street_view_image_path, 3.5),
+            '{{subject_photo}}': (property_data.street_view_image_path, 3.5),
         })
 
         # Replace image placeholders in regular paragraphs/cells (legacy + BOV names)
@@ -1499,6 +2283,10 @@ Start with the line "Sources Used:" then a numbered list "1. ", "2. ", etc. Plai
         # TOC is a full-page floating blue panel — without a page break before
         # EXECUTIVE SUMMARY, body text renders underneath it (page-2 bleed).
         self._ensure_page_break_before_heading(doc, "EXECUTIVE SUMMARY")
+
+        # Keep a blank line above section titles (e.g. after General Information table)
+        for heading in self.SECTION_HEADINGS_NEEDING_SPACE:
+            self._ensure_blank_before_heading(doc, heading)
         
         # Remove the programmatic market analysis section since we're using placeholders
         # self._create_market_analysis_section(doc, property_data)
@@ -1530,15 +2318,33 @@ Start with the line "Sources Used:" then a numbered list "1. ", "2. ", etc. Plai
             for br in paragraph._element.iter(qn("w:br"))
         )
 
+    # Section titles that need a blank line above them (matches source BOV layout)
+    SECTION_HEADINGS_NEEDING_SPACE = (
+        "LOCATION SUMMARY",
+        "AERIAL MAP",
+        "SUBJECT PHOTOS",
+        "PROPERTY SUMMARY",
+        "REGIONAL ANALYSIS",
+        "DEMOGRAPHIC ANALYSIS",
+        "PROPERTY COMPARABLES",
+        "RECONCILIATION TABLE",
+        "SALES CONCLUSION",
+        "CERTIFICATION AND DISCLAIMERS",
+    )
+
     def _collapse_empty_spacing(self, doc: Document) -> None:
         """Remove consecutive empty paragraphs that create large white gaps.
 
         Never deletes a paragraph that carries a page break — those look
         \"empty\" in paragraph.text but are required for TOC / section layout.
+        Also keeps the blank line immediately before major section headings.
         """
+        from docx.oxml.ns import qn
+
+        paragraphs = list(doc.paragraphs)
         empty_streak = 0
         to_remove = []
-        for paragraph in doc.paragraphs:
+        for idx, paragraph in enumerate(paragraphs):
             text = paragraph.text.strip()
             has_drawing = bool(
                 paragraph._element.xpath(".//*[local-name()='drawing']")
@@ -1549,8 +2355,16 @@ Start with the line "Sources Used:" then a numbered list "1. ", "2. ", etc. Plai
                 continue
             if not text and not has_drawing:
                 empty_streak += 1
-                # Keep at most one blank paragraph in a row
-                if empty_streak > 1:
+                # Keep blank that sits directly above a section heading
+                next_text = ""
+                if idx + 1 < len(paragraphs):
+                    next_text = paragraphs[idx + 1].text.strip().upper()
+                protects_heading = any(
+                    next_text.startswith(h) for h in self.SECTION_HEADINGS_NEEDING_SPACE
+                )
+                # Keep at most one blank paragraph in a row (and always keep
+                # the one before a section heading)
+                if empty_streak > 1 and not protects_heading:
                     to_remove.append(paragraph._element)
             else:
                 empty_streak = 0
@@ -1560,6 +2374,33 @@ Start with the line "Sources Used:" then a numbered list "1. ", "2. ", etc. Plai
                 parent.remove(element)
         if to_remove:
             logger.info("Collapsed %d extra empty paragraphs", len(to_remove))
+
+    def _ensure_blank_before_heading(self, doc: Document, heading: str) -> None:
+        """Ensure one empty paragraph sits above `heading` (spacing after tables)."""
+        from docx.oxml import OxmlElement
+        from docx.oxml.ns import qn
+
+        target = None
+        for paragraph in doc.paragraphs:
+            if paragraph.text.strip().upper().startswith(heading.upper()):
+                target = paragraph
+                break
+        if target is None:
+            return
+
+        prev = target._element.getprevious()
+        if prev is not None and prev.tag == qn("w:p"):
+            prev_text = "".join(t.text or "" for t in prev.iter(qn("w:t"))).strip()
+            has_drawing = any(True for _ in prev.iter(qn("w:drawing")))
+            has_page_break = any(
+                br.get(qn("w:type")) == "page" for br in prev.iter(qn("w:br"))
+            )
+            if not prev_text and not has_drawing and not has_page_break:
+                return  # blank already present
+
+        new_p = OxmlElement("w:p")
+        target._element.addprevious(new_p)
+        logger.info("Inserted blank paragraph before %s", heading)
 
     def _ensure_page_break_before_heading(self, doc: Document, heading: str) -> None:
         """Insert a page break immediately before `heading` if one is missing.
@@ -1656,80 +2497,188 @@ Start with the line "Sources Used:" then a numbered list "1. ", "2. ", etc. Plai
             logger.error(f"Failed to apply color theme '{theme}': {exc}")
 
     def _replace_text_in_runs(self, paragraph, placeholder: str, replacement: str):
-        """Replace text while preserving the formatting of runs"""
-        if placeholder in paragraph.text:
-            # Handle em dash replacement
-            replacement = replacement.replace('--', '–')
-            
-            # Work with runs to preserve formatting
-            for run in paragraph.runs:
-                if placeholder in run.text:
-                    # Replace the placeholder while keeping the run's formatting
-                    run.text = run.text.replace(placeholder, replacement)
-                    return
-            
-            # If placeholder spans multiple runs, we need a more complex approach
+        """Replace text while preserving run formatting.
+
+        Newlines in the replacement become real paragraphs — never soft line
+        breaks. Soft breaks inside justified (jc=both) paragraphs stretch the
+        short last line ("companies          and          startups.").
+        """
+        from docx.oxml.ns import qn
+
+        if placeholder not in paragraph.text:
+            return
+
+        replacement = (replacement or "").replace("--", "–")
+        # Split into paragraph chunks (blank-line or single newline)
+        chunks = [c.strip() for c in re.split(r"\r?\n\s*\r?\n|\r?\n", replacement) if c.strip()]
+        if not chunks:
+            chunks = [""]
+
+        first, *rest = chunks
+
+        # Fast path: placeholder lives in a single run
+        replaced = False
+        for run in paragraph.runs:
+            if placeholder in (run.text or ""):
+                run.text = (run.text or "").replace(placeholder, first)
+                replaced = True
+                break
+
+        if not replaced:
             full_text = paragraph.text
-            if placeholder in full_text:
-                # Store the formatting of each character
-                char_formats = []
-                char_index = 0
-                
-                for run in paragraph.runs:
-                    for char in run.text:
-                        char_formats.append({
-                            'bold': run.bold,
-                            'italic': run.italic,
-                            'underline': run.underline,
-                            'font_name': run.font.name,
-                            'font_size': run.font.size,
-                            'run': run
-                        })
-                        char_index += 1
-                
-                # Find where the placeholder starts
-                placeholder_start = full_text.find(placeholder)
-                if placeholder_start != -1:
-                    # Clear the paragraph
-                    paragraph.clear()
-                    
-                    # Add the text before placeholder
-                    if placeholder_start > 0:
-                        run = paragraph.add_run(full_text[:placeholder_start])
-                        if char_formats and placeholder_start < len(char_formats):
-                            format_info = char_formats[placeholder_start - 1]
-                            if format_info['bold'] is not None:
-                                run.bold = format_info['bold']
-                            if format_info['italic'] is not None:
-                                run.italic = format_info['italic']
-                    
-                    # Add the replacement text with the same formatting as the placeholder
-                    if placeholder_start < len(char_formats):
-                        format_info = char_formats[placeholder_start]
-                        run = paragraph.add_run(replacement)
-                        if format_info['bold'] is not None:
-                            run.bold = format_info['bold']
-                        if format_info['italic'] is not None:
-                            run.italic = format_info['italic']
-                        if format_info['underline'] is not None:
-                            run.underline = format_info['underline']
-                        if format_info['font_name']:
-                            run.font.name = format_info['font_name']
-                        if format_info['font_size']:
-                            run.font.size = format_info['font_size']
-                    else:
-                        paragraph.add_run(replacement)
-                    
-                    # Add the text after placeholder
-                    text_after = full_text[placeholder_start + len(placeholder):]
-                    if text_after:
-                        run = paragraph.add_run(text_after)
-                        if char_formats and placeholder_start + len(placeholder) < len(char_formats):
-                            format_info = char_formats[placeholder_start + len(placeholder)]
-                            if format_info['bold'] is not None:
-                                run.bold = format_info['bold']
-                            if format_info['italic'] is not None:
-                                run.italic = format_info['italic']
+            placeholder_start = full_text.find(placeholder)
+            if placeholder_start == -1:
+                return
+
+            char_formats = []
+            for run in paragraph.runs:
+                for _char in run.text or "":
+                    char_formats.append(
+                        {
+                            "bold": run.bold,
+                            "italic": run.italic,
+                            "underline": run.underline,
+                            "font_name": run.font.name,
+                            "font_size": run.font.size,
+                        }
+                    )
+
+            paragraph.clear()
+
+            def _apply_format(run, format_info):
+                if not format_info:
+                    return
+                if format_info.get("bold") is not None:
+                    run.bold = format_info["bold"]
+                if format_info.get("italic") is not None:
+                    run.italic = format_info["italic"]
+                if format_info.get("underline") is not None:
+                    run.underline = format_info["underline"]
+                if format_info.get("font_name"):
+                    run.font.name = format_info["font_name"]
+                if format_info.get("font_size"):
+                    run.font.size = format_info["font_size"]
+
+            if placeholder_start > 0:
+                run = paragraph.add_run(full_text[:placeholder_start])
+                if char_formats:
+                    _apply_format(run, char_formats[placeholder_start - 1])
+
+            run = paragraph.add_run(first)
+            if placeholder_start < len(char_formats):
+                _apply_format(run, char_formats[placeholder_start])
+
+            text_after = full_text[placeholder_start + len(placeholder) :]
+            if text_after:
+                run = paragraph.add_run(text_after)
+                after_idx = placeholder_start + len(placeholder)
+                if after_idx < len(char_formats):
+                    _apply_format(run, char_formats[after_idx])
+
+        # Extra chunks → sibling paragraphs (copy pPr so justify/style match)
+        if rest:
+            from copy import deepcopy
+            from docx.oxml import OxmlElement
+
+            anchor = paragraph._p
+            pPr = paragraph._p.find(qn("w:pPr"))
+            for chunk in rest:
+                new_p = OxmlElement("w:p")
+                if pPr is not None:
+                    new_p.append(deepcopy(pPr))
+                new_r = OxmlElement("w:r")
+                # Copy first run props when available
+                if paragraph.runs:
+                    src_rPr = paragraph.runs[0]._r.find(qn("w:rPr"))
+                    if src_rPr is not None:
+                        new_r.append(deepcopy(src_rPr))
+                new_t = OxmlElement("w:t")
+                if chunk.startswith(" ") or chunk.endswith(" "):
+                    new_t.set(qn("xml:space"), "preserve")
+                new_t.text = chunk
+                new_r.append(new_t)
+                new_p.append(new_r)
+                anchor.addnext(new_p)
+                anchor = new_p
+
+    def _fix_justified_soft_breaks(self, doc: Document) -> None:
+        """Turn soft line breaks in justified paragraphs into real paragraphs.
+
+        Safety net for any path that still injects w:br into jc=both text.
+        """
+        from copy import deepcopy
+        from docx.oxml import OxmlElement
+        from docx.oxml.ns import qn
+
+        fixed = 0
+        targets = []
+        for p in list(doc.paragraphs):
+            pPr = p._p.find(qn("w:pPr"))
+            if pPr is None:
+                continue
+            jc = pPr.find(qn("w:jc"))
+            if jc is None or jc.get(qn("w:val")) not in ("both", "distribute"):
+                continue
+            soft = [
+                br
+                for br in p._p.iter(qn("w:br"))
+                if br.get(qn("w:type")) in (None, "textWrapping")
+            ]
+            if soft:
+                targets.append(p)
+
+        for paragraph in targets:
+            text = paragraph.text or ""
+            if "\n" not in text:
+                for br in list(paragraph._p.iter(qn("w:br"))):
+                    if br.get(qn("w:type")) != "page":
+                        parent = br.getparent()
+                        if parent is not None:
+                            parent.remove(br)
+                continue
+
+            chunks = [c.strip() for c in re.split(r"\n+", text) if c.strip()]
+            if len(chunks) <= 1:
+                for br in list(paragraph._p.iter(qn("w:br"))):
+                    if br.get(qn("w:type")) != "page":
+                        parent = br.getparent()
+                        if parent is not None:
+                            parent.remove(br)
+                continue
+
+            pPr = paragraph._p.find(qn("w:pPr"))
+            src_rPr = None
+            if paragraph.runs:
+                src_rPr = paragraph.runs[0]._r.find(qn("w:rPr"))
+
+            for child in list(paragraph._p):
+                if child.tag != qn("w:pPr"):
+                    paragraph._p.remove(child)
+
+            def _make_run(content: str):
+                new_r = OxmlElement("w:r")
+                if src_rPr is not None:
+                    new_r.append(deepcopy(src_rPr))
+                new_t = OxmlElement("w:t")
+                if content.startswith(" ") or content.endswith(" "):
+                    new_t.set(qn("xml:space"), "preserve")
+                new_t.text = content
+                new_r.append(new_t)
+                return new_r
+
+            paragraph._p.append(_make_run(chunks[0]))
+            anchor = paragraph._p
+            for chunk in chunks[1:]:
+                new_p = OxmlElement("w:p")
+                if pPr is not None:
+                    new_p.append(deepcopy(pPr))
+                new_p.append(_make_run(chunk))
+                anchor.addnext(new_p)
+                anchor = new_p
+            fixed += 1
+
+        if fixed:
+            logger.info("Fixed soft breaks in %d justified paragraph(s)", fixed)
 
     def _replace_text_in_document(self, doc: Document, replacements: Dict[str, str]):
         """Replace text in all parts of the document while preserving formatting"""

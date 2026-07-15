@@ -23,7 +23,7 @@ GOOGLE_STATICMAP_URL = "https://maps.googleapis.com/maps/api/staticmap"
 
 
 class HybridLocationService:
-    """Use Esri for geocoding, imagery, and demographics; Google for Street View."""
+    """Esri for geocoding/demographics; Google for aerial + Street View imagery."""
 
     def __init__(
         self,
@@ -68,40 +68,81 @@ class HybridLocationService:
         raise ValueError("No geocoding provider available")
 
     def get_aerial_image(self, lat: float, lng: float, output_path: Path) -> Optional[str]:
+        """Prefer Google Static Maps (hybrid) for aerial; fall back to Esri."""
+        if self.google_api_key:
+            try:
+                return self._get_aerial_google(lat, lng, output_path)
+            except Exception as exc:
+                logger.warning("Google aerial image failed, trying Esri fallback: %s", exc)
+
         if self.esri_api_key:
             try:
                 return self._get_aerial_esri(lat, lng, output_path)
             except Exception as exc:
-                logger.warning("Esri aerial image failed, trying Google fallback: %s", exc)
-
-        if self.google_api_key:
-            return self._get_aerial_google(lat, lng, output_path)
+                logger.warning("Esri aerial image failed: %s", exc)
 
         logger.warning("No aerial imagery provider available")
         return None
 
-    def get_street_view_image(self, address: str, output_path: Path) -> Optional[str]:
+    def get_street_view_image(
+        self,
+        address: str,
+        output_path: Path,
+        lat: Optional[float] = None,
+        lng: Optional[float] = None,
+    ) -> Optional[str]:
+        """Fetch a real Google Street View photo (never an aerial / static map)."""
         if not self.google_api_key:
             logger.info("Skipping Street View (GOOGLE_API_KEY not configured)")
             return None
 
+        location = (
+            f"{lat},{lng}" if lat is not None and lng is not None else address
+        )
+
+        # Metadata check avoids embedding Google's "Sorry, we don't have imagery" placeholder
+        if not self._street_view_available(location):
+            logger.warning("Street View not available for location: %s", location)
+            return None
+
         params = {
-            "size": "600x500",
-            "location": address,
+            "size": "640x480",
+            "location": location,
             "pitch": "0",
             "fov": "90",
+            "source": "outdoor",
             "key": self.google_api_key,
         }
         response = requests.get(GOOGLE_STREETVIEW_URL, params=params, timeout=30)
         response.raise_for_status()
 
-        if response.headers.get("content-type", "").startswith("image/"):
-            output_path.parent.mkdir(parents=True, exist_ok=True)
-            output_path.write_bytes(response.content)
-            return str(output_path)
+        content_type = response.headers.get("content-type", "")
+        if not content_type.startswith("image/"):
+            logger.warning("Street View did not return an image for %s", location)
+            return None
 
-        logger.warning("Street View not available for this address")
-        return None
+        # Reject tiny placeholder responses
+        if len(response.content) < 8000:
+            logger.warning("Street View response looks like a placeholder for %s", location)
+            return None
+
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_bytes(response.content)
+        return str(output_path)
+
+    def _street_view_available(self, location: str) -> bool:
+        try:
+            response = requests.get(
+                f"{GOOGLE_STREETVIEW_URL}/metadata",
+                params={"location": location, "source": "outdoor", "key": self.google_api_key},
+                timeout=20,
+            )
+            response.raise_for_status()
+            status = (response.json() or {}).get("status", "")
+            return status == "OK"
+        except Exception as exc:
+            logger.warning("Street View metadata check failed: %s", exc)
+            return False
 
     def get_demographics(self, lat: float, lng: float) -> Dict:
         if not self.esri_api_key:
@@ -259,19 +300,41 @@ class HybridLocationService:
         return str(output_path)
 
     def _get_aerial_google(self, lat: float, lng: float, output_path: Path) -> str:
+        """Google Static Maps hybrid aerial (satellite + labels + pin), saved as JPEG."""
+        from io import BytesIO
+
         params = {
             "center": f"{lat},{lng}",
             "zoom": "18",
-            "size": "1920x1920",
+            "size": "640x640",
+            "scale": "2",
             "maptype": "hybrid",
             "key": self.google_api_key,
-            "markers": f"{lat},{lng}",
+            "markers": f"color:red|{lat},{lng}",
         }
         response = requests.get(GOOGLE_STATICMAP_URL, params=params, timeout=30)
         response.raise_for_status()
 
+        if not response.headers.get("content-type", "").startswith("image/"):
+            raise ValueError("Google Static Map did not return an image")
+
+        output_path = Path(output_path)
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        output_path.write_bytes(response.content)
+
+        data = response.content
+        # Static Maps returns PNG; Word template slots expect JPEG
+        if data[:4] == b"\x89PNG":
+            try:
+                from PIL import Image
+
+                img = Image.open(BytesIO(data)).convert("RGB")
+                buf = BytesIO()
+                img.save(buf, format="JPEG", quality=90)
+                data = buf.getvalue()
+            except Exception as exc:
+                logger.warning("Could not convert Google aerial PNG to JPEG: %s", exc)
+
+        output_path.write_bytes(data)
         return str(output_path)
 
     def _get_demographics_esri(self, lat: float, lng: float) -> Dict:
