@@ -154,6 +154,21 @@ class HybridLocationService:
             logger.warning("Esri demographics unavailable, caller may use AI fallback: %s", exc)
             return {}
 
+    def get_admin_demographics(self, lat: float, lng: float) -> Dict[str, Dict]:
+        """Esri GeoEnrichment for US / State / County intersecting the point.
+
+        Returns {"us": {...}, "state": {...}, "county": {...}} with normalized
+        keys used by BOV population / household / tenure tables. Empty {} on failure.
+        """
+        if not self.esri_api_key:
+            return {}
+
+        try:
+            return self._get_admin_demographics_esri(lat, lng)
+        except Exception as exc:
+            logger.warning("Esri admin demographics unavailable: %s", exc)
+            return {}
+
     def get_ring_demographics(
         self, lat: float, lng: float, radii=(1, 3, 5)
     ) -> Dict[str, Dict]:
@@ -197,6 +212,173 @@ class HybridLocationService:
                 radius_key = self._ring_key(radius, len(rings), radii)
                 rings.setdefault(radius_key, {}).update(attributes)
         return rings
+
+    def _get_admin_demographics_esri(self, lat: float, lng: float) -> Dict[str, Dict]:
+        """Pull KeyUSFacts for WholeUSA / State / County at the property point."""
+        analysis_vars = [
+            "KeyUSFacts.TOTPOP_CY",
+            "KeyUSFacts.TOTPOP_FY",
+            "KeyUSFacts.TOTPOP20",
+            "KeyUSFacts.TOTPOP10",
+            "KeyUSFacts.TOTHH_CY",
+            "KeyUSFacts.TOTHH_FY",
+            "KeyUSFacts.AVGHHSZ_CY",
+            "KeyUSFacts.OWNER_CY",
+            "KeyUSFacts.RENTER_CY",
+            "KeyUSFacts.TOTHU_CY",
+        ]
+        params = {
+            "f": "json",
+            "token": self.esri_api_key,
+            "returnGeometry": "false",
+            "analysisVariables": json.dumps(analysis_vars),
+            "studyAreas": json.dumps(
+                [
+                    {
+                        "geometry": {
+                            "x": lng,
+                            "y": lat,
+                            "spatialReference": {"wkid": 4326},
+                        },
+                        "comparisonLevels": [
+                            {"layer": "US.WholeUSA"},
+                            {"layer": "US.States"},
+                            {"layer": "US.Counties"},
+                        ],
+                    }
+                ]
+            ),
+        }
+        response = requests.post(ESRI_ENRICH_URL, data=params, timeout=60)
+        response.raise_for_status()
+        data = response.json()
+        self._check_esri_response(data, "admin enrichment")
+
+        features = (
+            data.get("results", [{}])[0]
+            .get("value", {})
+            .get("FeatureSet", [{}])[0]
+            .get("features", [])
+        )
+        land_sq_mi = self._get_land_areas_sq_mi(lat, lng)
+        out: Dict[str, Dict] = {}
+        for record in features:
+            attrs = record.get("attributes", {}) or {}
+            level = (attrs.get("StdGeographyLevel") or "").upper()
+            name = attrs.get("StdGeographyName") or ""
+            if "WHOLEUSA" in level or name.lower() == "united states":
+                geo_key = "us"
+            elif "STATES" in level:
+                geo_key = "state"
+            elif "COUNTIES" in level:
+                geo_key = "county"
+            else:
+                # Skip the local block-group / point feature (no StdGeography*)
+                continue
+            out[geo_key] = self._normalize_admin_attrs(attrs, land_sq_mi.get(geo_key))
+        return out
+
+    @staticmethod
+    def _normalize_admin_attrs(attrs: Dict, land_sq_mi: Optional[float]) -> Dict:
+        def _num(*names):
+            for name in names:
+                if name in attrs and attrs[name] is not None:
+                    try:
+                        return float(attrs[name])
+                    except (TypeError, ValueError):
+                        continue
+            return None
+
+        pop_2010 = _num("TOTPOP10", "KeyUSFacts.TOTPOP10")
+        pop_2020 = _num("TOTPOP20", "KeyUSFacts.TOTPOP20")
+        pop_cy = _num("TOTPOP_CY", "KeyUSFacts.TOTPOP_CY")
+        pop_fy = _num("TOTPOP_FY", "KeyUSFacts.TOTPOP_FY")
+        hh_cy = _num("TOTHH_CY", "KeyUSFacts.TOTHH_CY")
+        hh_fy = _num("TOTHH_FY", "KeyUSFacts.TOTHH_FY")
+        hhsize_cy = _num("AVGHHSZ_CY", "KeyUSFacts.AVGHHSZ_CY")
+        owner = _num("OWNER_CY", "KeyUSFacts.OWNER_CY")
+        renter = _num("RENTER_CY", "KeyUSFacts.RENTER_CY")
+        hu_cy = _num("TOTHU_CY", "KeyUSFacts.TOTHU_CY")
+
+        hhsize_fy = None
+        if pop_fy and hh_fy and hh_fy > 0:
+            hhsize_fy = round(pop_fy / hh_fy, 2)
+
+        owner_pct = renter_pct = None
+        if owner is not None and renter is not None and (owner + renter) > 0:
+            total = owner + renter
+            owner_pct = round(100.0 * owner / total, 1)
+            renter_pct = round(100.0 * renter / total, 1)
+
+        dens_2020 = dens_cy = None
+        if land_sq_mi and land_sq_mi > 0:
+            if pop_2020 is not None:
+                dens_2020 = round(pop_2020 / land_sq_mi)
+            if pop_cy is not None:
+                dens_cy = round(pop_cy / land_sq_mi)
+
+        return {
+            "name": attrs.get("StdGeographyName"),
+            "pop_2010": int(pop_2010) if pop_2010 is not None else None,
+            "pop_2020": int(pop_2020) if pop_2020 is not None else None,
+            "pop_cy": int(pop_cy) if pop_cy is not None else None,
+            "pop_fy": int(pop_fy) if pop_fy is not None else None,
+            "hh_cy": int(hh_cy) if hh_cy is not None else None,
+            "hh_fy": int(hh_fy) if hh_fy is not None else None,
+            "hhsize_cy": round(hhsize_cy, 2) if hhsize_cy is not None else None,
+            "hhsize_fy": hhsize_fy,
+            "owner_pct": owner_pct,
+            "renter_pct": renter_pct,
+            "housing_units_cy": int(hu_cy) if hu_cy is not None else None,
+            "density_2020": dens_2020,
+            "density_cy": dens_cy,
+            "land_sq_mi": land_sq_mi,
+        }
+
+    def _get_land_areas_sq_mi(self, lat: float, lng: float) -> Dict[str, float]:
+        """Census TIGERWeb land area (m² → sq mi) for state/county; US is fixed."""
+        # U.S. Census Bureau figure for contiguous + AK/HI land area (sq mi)
+        areas: Dict[str, float] = {"us": 3531905.43}
+        sqm_to_sqmi = 2589988.110336
+
+        tiger = (
+            "https://tigerweb.geo.census.gov/arcgis/rest/services/"
+            "TIGERweb/State_County/MapServer/{layer}/query"
+        )
+        point = {
+            "geometry": f"{lng},{lat}",
+            "geometryType": "esriGeometryPoint",
+            "inSR": 4326,
+            "spatialRel": "esriSpatialRelIntersects",
+            "returnGeometry": "false",
+            "f": "json",
+        }
+        try:
+            state_resp = requests.get(
+                tiger.format(layer=0),
+                params={**point, "outFields": "NAME,AREALAND"},
+                timeout=30,
+            )
+            state_resp.raise_for_status()
+            state_feats = state_resp.json().get("features") or []
+            if state_feats:
+                land = float(state_feats[0]["attributes"]["AREALAND"])
+                areas["state"] = land / sqm_to_sqmi
+
+            county_resp = requests.get(
+                tiger.format(layer=1),
+                params={**point, "outFields": "NAME,AREALAND"},
+                timeout=30,
+            )
+            county_resp.raise_for_status()
+            county_feats = county_resp.json().get("features") or []
+            if county_feats:
+                land = float(county_feats[0]["attributes"]["AREALAND"])
+                areas["county"] = land / sqm_to_sqmi
+        except Exception as exc:
+            logger.warning("Census TIGER land area lookup failed: %s", exc)
+
+        return areas
 
     @staticmethod
     def _ring_key(radius, index, radii) -> str:

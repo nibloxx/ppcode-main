@@ -84,6 +84,14 @@ class CompExtractor:
             self._render_comp_pages(pdf_path, comps)
             # Fallback: embedded map/photo crops if page render failed
             self._extract_images_from_pdf(pdf_path, comps)
+
+            # Office Comp Summary PDFs often don't match land-comp text patterns.
+            # Always ensure we still return one stub per rendered page so the BOV
+            # can insert the uploaded pages instead of keeping the template sample.
+            if not any(getattr(c, "page_image_path", None) for c in comps):
+                page_stubs = self._comps_from_pdf_pages(pdf_path)
+                if page_stubs:
+                    comps = page_stubs
             
             logger.info(f"Successfully extracted {len(comps)} comps from PDF")
             
@@ -320,7 +328,46 @@ class CompExtractor:
                 not pages or page_num > pages[-1]
             ):
                 pages.append(page_num)
+            elif re.search(r"Sale Comp Status:", text, re.IGNORECASE) and (
+                not pages or page_num > pages[-1]
+            ):
+                # Office Comp Summary cards (often 2 per page)
+                pages.append(page_num)
         return pages
+
+    def _comps_from_pdf_pages(self, pdf_path: str) -> List[CompProperty]:
+        """Render every PDF page and return stub comps (for Office Comp layouts)."""
+        try:
+            import fitz
+
+            pdf_document = fitz.open(pdf_path)
+            matrix = fitz.Matrix(2.0, 2.0)
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            stubs: List[CompProperty] = []
+            for page_num in range(pdf_document.page_count):
+                page = pdf_document[page_num]
+                text = page.get_text() or ""
+                # Skip near-empty pages
+                if len(text.strip()) < 40:
+                    continue
+                pix = page.get_pixmap(matrix=matrix, alpha=False)
+                pix = self._trim_pixmap(pix)
+                out_path = self.images_dir / f"comp_page_{page_num + 1}_{timestamp}.png"
+                pix.save(str(out_path))
+                stubs.append(
+                    CompProperty(
+                        comp_number=page_num + 1,
+                        property_name=f"Comparable page {page_num + 1}",
+                        page_image_path=str(out_path),
+                        image_path=str(out_path),
+                    )
+                )
+                logger.info("Rendered CoStar page %d -> %s", page_num + 1, out_path.name)
+            pdf_document.close()
+            return stubs
+        except Exception as e:
+            logger.error("Error rendering all comp PDF pages: %s", e)
+            return []
 
     def _trim_pixmap(self, pix) -> "fitz.Pixmap":
         """Crop mostly-white margins so single-card pages pack better (2 per Word page)."""
@@ -384,17 +431,22 @@ class CompExtractor:
         Pages that already show 2 cards stay one image; single-card pages are
         trimmed so Word can pack ~2 images per page.
         """
-        if not comps:
-            return
         try:
             import fitz
 
             pdf_document = fitz.open(pdf_path)
             start_pages = self._comp_start_pages(pdf_document)
 
-            # Fallback: one page per comp in order when headers aren't detected
+            # Always cover the full PDF — office packs often have 2 cards/page
             if len(start_pages) < 1:
-                start_pages = list(range(min(len(comps), pdf_document.page_count)))
+                start_pages = list(range(pdf_document.page_count))
+            else:
+                # Include any later pages that still look like comps
+                for page_num in range(pdf_document.page_count):
+                    if page_num not in start_pages:
+                        text = pdf_document[page_num].get_text() or ""
+                        if re.search(r"Sale Comp (?:ID|Status):", text, re.IGNORECASE):
+                            start_pages.append(page_num)
 
             # Deduplicate page indexes while preserving order
             seen_pages = set()
@@ -403,6 +455,17 @@ class CompExtractor:
                 if p not in seen_pages:
                     seen_pages.add(p)
                     unique_pages.append(p)
+
+            # If text parsing found no comps, create stubs so pages still attach
+            if not comps:
+                comps.clear()
+                for i, _page_num in enumerate(unique_pages):
+                    comps.append(
+                        CompProperty(
+                            comp_number=i + 1,
+                            property_name=f"Comparable page {i + 1}",
+                        )
+                    )
 
             matrix = fitz.Matrix(2.0, 2.0)
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -463,6 +526,25 @@ class CompExtractor:
                     comp.page_image_path = path
                     comp.image_path = path
                     li += 1
+
+            # Extra pages not yet attached — append stub comps so they appear in BOV
+            attached_paths = {
+                getattr(c, "page_image_path", None) for c in comps
+            }
+            next_num = max((c.comp_number for c in comps), default=0) + 1
+            for page_num in unique_pages:
+                path = page_paths.get(page_num)
+                if path and path not in attached_paths:
+                    comps.append(
+                        CompProperty(
+                            comp_number=next_num,
+                            property_name=f"Comparable page {page_num + 1}",
+                            page_image_path=path,
+                            image_path=path,
+                        )
+                    )
+                    attached_paths.add(path)
+                    next_num += 1
 
             pdf_document.close()
         except Exception as e:

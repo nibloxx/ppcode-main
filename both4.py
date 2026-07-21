@@ -749,7 +749,7 @@ Rules:
                 for run in nxt.runs:
                     run.italic = True
                     run.font.color.rgb = RGBColor(0x00, 0x70, 0xC0)
-                    run.font.size = Pt(10)
+                    run.font.size = Pt(12)
             break
 
     def _generate_property_summary(self, context: str) -> str:
@@ -1040,21 +1040,101 @@ Rules:
         except Exception as exc:
             logger.warning("Could not overlay Esri ring demographics: %s", exc)
 
-        # Overlay point-level Esri county employment / population when available
+        # Overlay US / State / County tables from Esri admin geographies (not point buffer)
         try:
-            county_demo = self.location_service.get_demographics(lat, lng)
-            if county_demo:
-                self._overlay_esri_county(dataset, county_demo)
+            admin = self.location_service.get_admin_demographics(lat, lng)
+            if admin:
+                self._overlay_esri_admin(dataset, admin)
                 dataset["demographics_source"] = "Esri GeoEnrichment"
-                logger.info("Overlaid Esri county demographics (employment/population)")
+                logger.info(
+                    "Overlaid Esri admin demographics (us=%s state=%s county=%s)",
+                    bool(admin.get("us")),
+                    bool(admin.get("state")),
+                    bool(admin.get("county")),
+                )
         except Exception as exc:
-            logger.warning("Could not overlay Esri county demographics: %s", exc)
+            logger.warning("Could not overlay Esri admin demographics: %s", exc)
 
         property_data.bov_dataset = dataset
         return self._format_bov_placeholders(dataset, property_data)
 
+    def _overlay_esri_admin(self, dataset: Dict, admin: Dict[str, Dict]) -> None:
+        """Replace US/State/County population, density, HH, tenure from Esri admin levels."""
+        pop = dataset.setdefault("population", {})
+        density = dataset.setdefault("density", {})
+        households = dataset.setdefault("households", {})
+        hh_size = dataset.setdefault("hh_size", {})
+        tenure = dataset.setdefault("tenure", {})
+
+        for year in ("2010", "2020", "2025"):
+            pop.setdefault(year, {})
+        for year in ("2020", "2025"):
+            density.setdefault(year, {})
+        for key in ("2024", "2029", "cagr"):
+            households.setdefault(key, {})
+            hh_size.setdefault(key, {})
+        tenure.setdefault("owner", {})
+        tenure.setdefault("renter", {})
+
+        for geo in ("us", "state", "county"):
+            row = admin.get(geo) or {}
+            if not row:
+                continue
+
+            if row.get("pop_2010") is not None:
+                pop["2010"][geo] = row["pop_2010"]
+            if row.get("pop_2020") is not None:
+                pop["2020"][geo] = row["pop_2020"]
+            if row.get("pop_cy") is not None:
+                pop["2025"][geo] = row["pop_cy"]
+
+            if row.get("density_2020") is not None:
+                density["2020"][geo] = row["density_2020"]
+            if row.get("density_cy") is not None:
+                density["2025"][geo] = row["density_cy"]
+
+            if row.get("hh_cy") is not None:
+                households["2024"][geo] = row["hh_cy"]
+            if row.get("hh_fy") is not None:
+                households["2029"][geo] = row["hh_fy"]
+            cagr_hh = self._cagr(row.get("hh_cy"), row.get("hh_fy"), years=5)
+            if cagr_hh is not None:
+                households["cagr"][geo] = cagr_hh
+
+            if row.get("hhsize_cy") is not None:
+                hh_size["2024"][geo] = row["hhsize_cy"]
+            hhsize_fy = row.get("hhsize_fy")
+            if hhsize_fy is None and row.get("pop_fy") and row.get("hh_fy"):
+                hhsize_fy = round(float(row["pop_fy"]) / float(row["hh_fy"]), 2)
+            if hhsize_fy is not None:
+                hh_size["2029"][geo] = hhsize_fy
+            cagr_hs = self._cagr(row.get("hhsize_cy"), hhsize_fy, years=5)
+            if cagr_hs is not None:
+                hh_size["cagr"][geo] = cagr_hs
+
+            if row.get("owner_pct") is not None:
+                tenure["owner"][geo] = row["owner_pct"]
+            if row.get("renter_pct") is not None:
+                tenure["renter"][geo] = row["renter_pct"]
+
+    @staticmethod
+    def _cagr(start, end, years: int = 5):
+        """Compound annual growth rate (%) over `years`."""
+        try:
+            start_f = float(start)
+            end_f = float(end)
+            if start_f <= 0 or end_f <= 0 or years <= 0:
+                return None
+            return round(((end_f / start_f) ** (1.0 / years) - 1.0) * 100.0, 1)
+        except (TypeError, ValueError, ZeroDivisionError):
+            return None
+
     def _overlay_esri_county(self, dataset: Dict, county_demo: Dict) -> None:
-        """Apply Esri point demographics to employment / population summary fields."""
+        """Legacy point-level overlay — employment only (never county population).
+
+        Point enrichment returns block-group scale population (~thousands), which
+        must not be written into the County column of US/State/County tables.
+        """
         emp = dataset.setdefault("employment", {})
         emp.setdefault("total_employment", {})
         emp.setdefault("unemployment_rate", {})
@@ -1063,10 +1143,6 @@ Rules:
             emp["total_employment"]["county"] = int(county_demo["employment_count"])
         if county_demo.get("unemployment_rate") is not None:
             emp["unemployment_rate"]["county"] = float(county_demo["unemployment_rate"])
-        if county_demo.get("population_current") is not None:
-            pop = dataset.setdefault("population", {})
-            pop.setdefault("2025", {})
-            pop["2025"]["county"] = int(county_demo["population_current"])
 
     @staticmethod
     def _to_number(value):
@@ -1598,11 +1674,12 @@ Rules:
     def _insert_comparables(self, doc: Document, comps: List[Any]) -> None:
         """Insert CoStar comparable pages after PROPERTY COMPARABLES.
 
-        Unique PDF page renders are inserted (deduped) and scaled so ~2 cards
-        fit on a Word page when the source page is a single trimmed card.
+        Removes any template sample comps image, then inserts unique PDF page
+        renders (deduped) sized for readable CoStar layout.
         """
         from docx.shared import Inches, Pt
         from docx.enum.text import WD_ALIGN_PARAGRAPH
+        from docx.oxml.ns import qn
 
         heading_idx = None
         for i, p in enumerate(doc.paragraphs):
@@ -1612,8 +1689,33 @@ Rules:
         if heading_idx is None:
             return
 
+        # Drop template sample screenshot(s) under PROPERTY COMPARABLES through
+        # the next section heading so uploaded CoStar pages replace them.
+        stop_headings = {
+            "RECONCILIATION TABLE",
+            "SALES CONCLUSION",
+            "CERTIFICATION AND DISCLAIMERS",
+            "OPINION OF VALUE",
+        }
+        for j in range(heading_idx, len(doc.paragraphs)):
+            p = doc.paragraphs[j]
+            upper = p.text.strip().upper()
+            if j > heading_idx and (
+                upper in stop_headings or upper.startswith("RECONCILIATION")
+            ):
+                break
+            for drawing in list(p._p.iter(qn("w:drawing"))):
+                parent = drawing.getparent()
+                if parent is not None:
+                    parent.remove(drawing)
+            for pict in list(p._p.iter(qn("w:pict"))):
+                parent = pict.getparent()
+                if parent is not None:
+                    parent.remove(pict)
+
         anchor = doc.paragraphs[heading_idx]
-        sorted_comps = sorted(comps, key=lambda c: getattr(c, "comp_number", 0))[:6]
+        # Do not truncate — Office Comp PDFs often have many pages (2 cards each)
+        sorted_comps = sorted(comps, key=lambda c: getattr(c, "comp_number", 0))
 
         # One image per unique CoStar page (avoids duplicating 2-card pages)
         seen_paths = set()
@@ -1650,7 +1752,7 @@ Rules:
             return
 
         # Fallback text details when no page images
-        for comp in sorted_comps:
+        for comp in sorted_comps[:6]:
             title_p = self._insert_paragraph_after(anchor)
             name = getattr(comp, "property_name", "") or "Property"
             run = title_p.add_run(name)
@@ -2284,6 +2386,9 @@ Rules:
         # EXECUTIVE SUMMARY, body text renders underneath it (page-2 bleed).
         self._ensure_page_break_before_heading(doc, "EXECUTIVE SUMMARY")
 
+        # Ensure TOC leaders are a single middle line (no title/page underlines)
+        self._normalize_toc_leaders(doc)
+
         # Keep a blank line above section titles (e.g. after General Information table)
         for heading in self.SECTION_HEADINGS_NEEDING_SPACE:
             self._ensure_blank_before_heading(doc, heading)
@@ -2305,7 +2410,10 @@ Rules:
         # Apply color theme to the report accent (post-process the saved file)
         if color_theme:
             self._apply_color_theme(output_path, color_theme)
-        
+
+        # TOC page numbers must match live pagination (not static template values)
+        self._refresh_toc_page_numbers(output_path)
+
         return str(output_path)
 
     @staticmethod
@@ -2401,6 +2509,215 @@ Rules:
         new_p = OxmlElement("w:p")
         target._element.addprevious(new_p)
         logger.info("Inserted blank paragraph before %s", heading)
+
+    def _normalize_toc_leaders(self, doc: Document) -> None:
+        """Force TOC rows to image-2 style: title | single middle line | page.
+
+        Does NOT hardcode page numbers — those are filled after save from the
+        actual section locations via `_refresh_toc_page_numbers`.
+        """
+        from docx.enum.text import WD_ALIGN_PARAGRAPH
+        from docx.enum.table import WD_CELL_VERTICAL_ALIGNMENT
+        from docx.oxml import OxmlElement
+        from docx.oxml.ns import qn
+        from docx.shared import Pt, RGBColor
+
+        if not doc.tables:
+            return
+        table = doc.tables[0]
+        first = table.rows[0].cells[0].text.strip().lower() if table.rows else ""
+        if "executive" not in first:
+            return
+
+        # TOC label only — page #s stay blank until Word resolves real pages
+        titles = [
+            "Executive Summary",
+            "Subject Photos",
+            "Demographics",
+            "Comparables",
+            "Certification",
+        ]
+
+        def clear_pbdr(p):
+            pPr = p._p.find(qn("w:pPr"))
+            if pPr is None:
+                return
+            pBdr = pPr.find(qn("w:pBdr"))
+            if pBdr is not None:
+                pPr.remove(pBdr)
+
+        def style_run(run):
+            run.font.size = Pt(11)
+            run.font.color.rgb = RGBColor(0xFF, 0xFF, 0xFF)
+            run.font.underline = False
+            rPr = run._r.get_or_add_rPr()
+            u = rPr.find(qn("w:u"))
+            if u is not None:
+                rPr.remove(u)
+            color = rPr.find(qn("w:color"))
+            if color is None:
+                color = OxmlElement("w:color")
+                rPr.append(color)
+            color.set(qn("w:val"), "FFFFFF")
+
+        def middle_border(p):
+            clear_pbdr(p)
+            pPr = p._p.get_or_add_pPr()
+            pBdr = OxmlElement("w:pBdr")
+            bottom = OxmlElement("w:bottom")
+            bottom.set(qn("w:val"), "single")
+            bottom.set(qn("w:sz"), "12")
+            bottom.set(qn("w:space"), "6")
+            bottom.set(qn("w:color"), "FFFFFF")
+            pBdr.append(bottom)
+            pPr.append(pBdr)
+
+        for ri, title in enumerate(titles):
+            if ri >= len(table.rows):
+                break
+            row = table.rows[ri]
+            # Keep existing page text as a temporary placeholder if present
+            existing_page = (row.cells[2].text or "").strip() or "—"
+
+            c0 = row.cells[0]
+            c0.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.CENTER
+            p0 = c0.paragraphs[0]
+            clear_pbdr(p0)
+            p0.alignment = WD_ALIGN_PARAGRAPH.LEFT
+            p0.clear()
+            style_run(p0.add_run(title))
+
+            c1 = row.cells[1]
+            c1.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.CENTER
+            p1 = c1.paragraphs[0]
+            p1.clear()
+            style_run(p1.add_run(" "))
+            middle_border(p1)
+
+            c2 = row.cells[2]
+            c2.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.CENTER
+            p2 = c2.paragraphs[0]
+            clear_pbdr(p2)
+            p2.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+            p2.clear()
+            style_run(p2.add_run(existing_page))
+
+        logger.info("Normalized TOC leaders to single middle-line style")
+
+    # TOC label -> body heading used to resolve the real page number
+    TOC_SECTION_HEADINGS = (
+        ("Executive Summary", "EXECUTIVE SUMMARY"),
+        ("Subject Photos", "SUBJECT PHOTOS"),
+        ("Demographics", "DEMOGRAPHIC ANALYSIS"),
+        ("Comparables", "PROPERTY COMPARABLES"),
+        ("Certification", "CERTIFICATION AND DISCLAIMERS"),
+    )
+
+    def _refresh_toc_page_numbers(self, output_path) -> None:
+        """Set TOC page numbers from where each section actually lands in the Word doc.
+
+        Uses Word COM so pagination matches what the user sees after generation
+        (comps, demographics, etc. can shift pages vs the static template).
+        """
+        try:
+            import win32com.client  # type: ignore
+        except ImportError:
+            logger.warning(
+                "win32com unavailable — TOC page numbers remain template placeholders"
+            )
+            return
+
+        path = str(Path(output_path).resolve())
+        word = None
+        doc = None
+        try:
+            word = win32com.client.DispatchEx("Word.Application")
+            word.Visible = False
+            word.DisplayAlerts = 0
+            doc = word.Documents.Open(FileName=path, AddToRecentFiles=False)
+            # Force layout so page numbers are accurate
+            doc.Repaginate()
+
+            total_pages = int(doc.ComputeStatistics(2))  # wdStatisticPages
+            # Resolve each body heading page (skip TOC page hits by matching uppercase)
+            resolved = {}
+            for toc_label, heading in self.TOC_SECTION_HEADINGS:
+                # Start search after page 2 (cover/TOC) when possible
+                start_page = 3 if total_pages >= 3 else 1
+                word.Selection.GoTo(What=1, Which=1, Count=start_page)
+                rng = doc.Range(word.Selection.Start, doc.Content.End)
+                find = rng.Find
+                find.ClearFormatting()
+                find.Text = heading
+                find.MatchCase = True
+                find.Forward = True
+                find.Wrap = 0  # wdFindStop
+                if find.Execute():
+                    resolved[toc_label] = int(rng.Information(3))  # wdActiveEndPageNumber
+                else:
+                    # Fallback: case-insensitive anywhere after page 1
+                    word.Selection.GoTo(What=1, Which=1, Count=2)
+                    rng = doc.Range(word.Selection.Start, doc.Content.End)
+                    find = rng.Find
+                    find.Text = heading
+                    find.MatchCase = False
+                    find.Forward = True
+                    find.Wrap = 0
+                    if find.Execute():
+                        resolved[toc_label] = int(rng.Information(3))
+
+            if not resolved:
+                logger.warning("Could not resolve any TOC section pages")
+                return
+
+            # Update first table that looks like the TOC
+            toc_table = None
+            for i in range(1, doc.Tables.Count + 1):
+                tbl = doc.Tables(i)
+                try:
+                    if "executive" in (tbl.Cell(1, 1).Range.Text or "").lower():
+                        toc_table = tbl
+                        break
+                except Exception:
+                    continue
+            if toc_table is None:
+                logger.warning("TOC table not found for page-number refresh")
+                return
+
+            for row_idx in range(1, toc_table.Rows.Count + 1):
+                try:
+                    label = (toc_table.Cell(row_idx, 1).Range.Text or "").strip()
+                    # Word cell text includes \r\x07
+                    label = label.replace("\r", "").replace("\x07", "").strip()
+                    page_num = resolved.get(label)
+                    if page_num is None:
+                        continue
+                    cell = toc_table.Cell(row_idx, 3)
+                    rng = cell.Range
+                    # Exclude the end-of-cell marker so formatting stays intact
+                    rng.MoveEnd(Unit=1, Count=-1)  # wdCharacter=1
+                    rng.Text = str(page_num)
+                    rng.Font.Color = 16777215  # white
+                    rng.Font.Size = 11
+                    cell.Range.ParagraphFormat.Alignment = 2  # wdAlignParagraphRight
+                except Exception as cell_exc:
+                    logger.warning("TOC row %s update failed: %s", row_idx, cell_exc)
+
+            doc.Save()
+            logger.info("Refreshed TOC page numbers from live pagination: %s", resolved)
+        except Exception as exc:
+            logger.warning("TOC page-number refresh failed: %s", exc)
+        finally:
+            try:
+                if doc is not None:
+                    doc.Close(False)
+            except Exception:
+                pass
+            try:
+                if word is not None:
+                    word.Quit()
+            except Exception:
+                pass
 
     def _ensure_page_break_before_heading(self, doc: Document, heading: str) -> None:
         """Insert a page break immediately before `heading` if one is missing.

@@ -140,7 +140,7 @@ def add_source(doc, text):
     p = doc.add_paragraph()
     run = p.add_run(text)
     run.italic = True
-    run.font.size = Pt(8.5)
+    run.font.size = Pt(12)
     run.font.color.rgb = GREY
     p.paragraph_format.space_after = Pt(10)
 
@@ -269,7 +269,7 @@ def population_tables(doc):
         ],
         widths=g3,
     )
-    add_source(doc, "Source: US Census")
+    add_source(doc, "Source: Esri GeoEnrichment")
 
 
 def household_tables(doc):
@@ -303,7 +303,7 @@ def household_tables(doc):
         ],
         widths=g3,
     )
-    add_source(doc, "Source: US Census")
+    add_source(doc, "Source: Esri GeoEnrichment")
 
 
 def ring_table(doc):
