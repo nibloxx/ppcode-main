@@ -79,6 +79,8 @@ class PropertyReportData:
     size_and_topography: str = ""
     population_analysis: str = ""
     household_trends: str = ""
+    housing_tenure: str = ""
+    local_area_analysis: str = ""
     employment_analysis: str = ""
     economic_factors: str = ""
     community_services: str = ""
@@ -789,8 +791,27 @@ Rules:
         return self._get_ai_response(prompt)
 
     def _generate_demographic_analysis(self, context: str) -> str:
-        """Generate demographic analysis - note this matches property_summary in the example"""
-        return self._generate_property_summary(context)
+        """Qualitative demographic overview — no invented statistics.
+
+        Exact population / household / tenure figures are filled later from
+        Esri tables via `_sync_narratives_to_table_data`.
+        """
+        prompt = f"""
+        Write a short DEMOGRAPHIC OVERVIEW (2-3 sentences) for this property.
+        Context:
+        {context}
+
+        Rules:
+        - Describe location character only (families, workforce, retail/office demand drivers).
+        - Do NOT invent or cite any specific numbers, percentages, dollars, or years.
+        - Do NOT invent median income, population totals, growth rates, or vacancy.
+        - Plain text only, no markdown.
+        Example tone: "The subject benefits from a solid demographic profile within the
+        county, with a mix of households and employment bases that support local
+        commercial demand. Accessibility to major corridors further strengthens the
+        draw for nearby residents and workers."
+        """
+        return self._get_ai_response(prompt)
 
     def _generate_size_topography(self, context: str) -> str:
         """Generate size and topography description"""
@@ -993,6 +1014,9 @@ Rules:
         property_data.table_values = self.build_bov_dataset(
             lat_f, lng_f, property_data
         )
+        # Rewrite demo/employment narratives from the SAME numbers shown in tables
+        # (Esri admin + employment_history) so verbiage never invents different figures.
+        self._sync_narratives_to_table_data(property_data)
         # Rebuild short valuation NOTES after GBA/valuation math is final
         property_data.reconciliation_notes = self._build_reconciliation_notes(property_data)
         property_data.table_values["{{reconciliation_notes}}"] = property_data.reconciliation_notes
@@ -1129,6 +1153,541 @@ Rules:
         except (TypeError, ValueError, ZeroDivisionError):
             return None
 
+    @staticmethod
+    def _fmt_int_commas(value) -> str:
+        try:
+            return f"{int(round(float(value))):,}"
+        except (TypeError, ValueError):
+            return ""
+
+    @staticmethod
+    def _fmt_pct_plain(value, decimals: int = 1) -> str:
+        try:
+            f = float(value)
+            # Keep enough precision for small rates like 0.02%
+            if decimals == 1 and 0 < abs(f) < 0.05:
+                return f"{f:.2f}%"
+            return f"{f:.{decimals}f}%"
+        except (TypeError, ValueError):
+            return ""
+
+    @staticmethod
+    def _fmt_dec(value, decimals: int = 2) -> str:
+        try:
+            return f"{float(value):.{decimals}f}"
+        except (TypeError, ValueError):
+            return ""
+
+    def _sync_narratives_to_table_data(self, property_data: "PropertyReportData") -> None:
+        """Overwrite AI narratives so they cite the same figures as BOV tables."""
+        dataset = getattr(property_data, "bov_dataset", None) or {}
+        if not dataset:
+            return
+        county = property_data.county or "the county"
+        state = property_data.state or "the state"
+        property_type = property_data.property_type or "commercial"
+
+        pop_text = self._build_population_analysis_from_data(dataset, county, state)
+        if pop_text:
+            property_data.population_analysis = pop_text
+
+        hh_text = self._build_household_trends_from_data(dataset, county, state)
+        if hh_text:
+            property_data.household_trends = hh_text
+
+        tenure_text = self._build_housing_tenure_from_data(dataset, county, state)
+        if tenure_text:
+            property_data.housing_tenure = tenure_text
+
+        local_text = self._build_local_area_analysis_from_data(
+            dataset, county, state, property_type
+        )
+        if local_text:
+            property_data.local_area_analysis = local_text
+
+        demo_text = self._build_demographic_overview_from_data(
+            dataset, county, state, property_type
+        )
+        if demo_text:
+            property_data.demographic_analysis = demo_text
+
+        emp_text = self._build_employment_analysis_from_data(dataset, county, state)
+        if emp_text:
+            property_data.employment_analysis = emp_text
+
+        # Keep placeholder map in sync if already built
+        if property_data.table_values:
+            property_data.table_values["{{population_analysis}}"] = (
+                property_data.population_analysis or ""
+            )
+            property_data.table_values["{{household_trends}}"] = (
+                property_data.household_trends or ""
+            )
+            property_data.table_values["{{housing_tenure}}"] = (
+                property_data.housing_tenure or ""
+            )
+            property_data.table_values["{{local_area_analysis}}"] = (
+                property_data.local_area_analysis or ""
+            )
+            property_data.table_values["{{demographic_analysis}}"] = (
+                property_data.demographic_analysis or ""
+            )
+            property_data.table_values["{{employment_analysis}}"] = (
+                property_data.employment_analysis or ""
+            )
+        logger.info(
+            "Synced population/household/tenure/local/demographic/employment narratives"
+        )
+
+    def _build_household_trends_from_data(
+        self, dataset: Dict, county: str, state: str
+    ) -> str:
+        """Household Trends paragraph from Esri NUMBER OF HOUSEHOLDS / HH SIZE tables."""
+        hh = dataset.get("households") or {}
+        hs = dataset.get("hh_size") or {}
+        hh_2024 = (hh.get("2024") or {}).get("county")
+        hh_2029 = (hh.get("2029") or {}).get("county")
+        hh_cagr = (hh.get("cagr") or {}).get("county")
+        hs_2024 = (hs.get("2024") or {}).get("county")
+        hs_2029 = (hs.get("2029") or {}).get("county")
+        hs_cagr = (hs.get("cagr") or {}).get("county")
+        us_hs_2024 = (hs.get("2024") or {}).get("us")
+
+        if hh_2024 is None or hh_2029 is None or hh_cagr is None:
+            return ""
+
+        county_label = county if county.lower().endswith("county") else f"{county} County"
+        hh_cagr_f = float(hh_cagr)
+        if hh_cagr_f >= 0:
+            hh_trend = (
+                f"projected to grow by {self._fmt_pct_plain(hh_cagr_f)} annually, increasing "
+                f"the number of households to {self._fmt_int_commas(hh_2029)} by 2029"
+            )
+        else:
+            hh_trend = (
+                f"projected to decline by {self._fmt_pct_plain(abs(hh_cagr_f))} annually, "
+                f"reducing the number of households to {self._fmt_int_commas(hh_2029)} by 2029"
+            )
+        parts = [
+            f"The 2024 number of households in {county_label} was "
+            f"{self._fmt_int_commas(hh_2024)}. The number of households in the county is "
+            f"{hh_trend}."
+        ]
+
+        if hs_2024 is not None and us_hs_2024 is not None:
+            try:
+                hs_c = float(hs_2024)
+                us_c = float(us_hs_2024)
+                if us_c > 0:
+                    diff_pct = ((hs_c / us_c) - 1.0) * 100.0
+                    if abs(diff_pct) < 0.05:
+                        size_cmp = (
+                            f"which was about the same as the United States average "
+                            f"household size of {self._fmt_dec(us_hs_2024)} for 2024"
+                        )
+                    elif diff_pct > 0:
+                        size_cmp = (
+                            f"which was {abs(diff_pct):.2f}% larger than the United States "
+                            f"average household size of {self._fmt_dec(us_hs_2024)} for 2024"
+                        )
+                    else:
+                        size_cmp = (
+                            f"which was {abs(diff_pct):.2f}% smaller than the United States "
+                            f"average household size of {self._fmt_dec(us_hs_2024)} for 2024"
+                        )
+                    size_sent = (
+                        f"The 2024 average household size for the county was "
+                        f"{self._fmt_dec(hs_2024)}, {size_cmp}."
+                    )
+                    if hs_2029 is not None and hs_cagr is not None:
+                        cagr_f = float(hs_cagr)
+                        if cagr_f < 0:
+                            size_sent += (
+                                f" The average household size in the county is anticipated "
+                                f"to retract by {self._fmt_pct_plain(abs(cagr_f))} annually, "
+                                f"reducing the average household size to "
+                                f"{self._fmt_dec(hs_2029)} by 2029."
+                            )
+                        elif cagr_f > 0:
+                            size_sent += (
+                                f" The average household size in the county is anticipated "
+                                f"to grow by {self._fmt_pct_plain(cagr_f)} annually, "
+                                f"increasing the average household size to "
+                                f"{self._fmt_dec(hs_2029)} by 2029."
+                            )
+                        else:
+                            size_sent += (
+                                f" The average household size in the county is anticipated "
+                                f"to remain near {self._fmt_dec(hs_2029)} through 2029."
+                            )
+                    parts.append(size_sent)
+            except (TypeError, ValueError):
+                pass
+
+        return " ".join(parts)
+
+    def _build_housing_tenure_from_data(
+        self, dataset: Dict, county: str, state: str
+    ) -> str:
+        """Housing Units paragraph from Esri owner/renter tenure table."""
+        tenure = dataset.get("tenure") or {}
+        owner_c = (tenure.get("owner") or {}).get("county")
+        renter_c = (tenure.get("renter") or {}).get("county")
+        owner_s = (tenure.get("owner") or {}).get("state")
+        owner_us = (tenure.get("owner") or {}).get("us")
+        if owner_c is None or renter_c is None:
+            return ""
+
+        county_label = county if county.lower().endswith("county") else f"{county} County"
+        try:
+            o = float(owner_c)
+            r = float(renter_c)
+        except (TypeError, ValueError):
+            return ""
+
+        if o >= r:
+            mix = (
+                f"exhibits an owner-majority housing mix, with about "
+                f"{self._fmt_pct_plain(o)} of occupied units owner-occupied and "
+                f"{self._fmt_pct_plain(r)} renter-occupied"
+            )
+        else:
+            mix = (
+                f"exhibits a renter-majority housing mix, with about "
+                f"{self._fmt_pct_plain(r)} of occupied units renter-occupied and "
+                f"{self._fmt_pct_plain(o)} owner-occupied"
+            )
+
+        sent = f"{county_label} {mix}."
+        try:
+            if owner_s is not None:
+                os_ = float(owner_s)
+                cmp_s = "above" if o > os_ else ("below" if o < os_ else "in line with")
+                sent += (
+                    f" The county owner-occupancy rate is {cmp_s} the {state} rate of "
+                    f"{self._fmt_pct_plain(os_)}"
+                )
+                if owner_us is not None:
+                    sent += (
+                        f" and compares with the U.S. average of "
+                        f"{self._fmt_pct_plain(owner_us)}"
+                    )
+                sent += "."
+            elif owner_us is not None:
+                sent += (
+                    f" By comparison, the U.S. owner-occupancy rate is "
+                    f"{self._fmt_pct_plain(owner_us)}."
+                )
+        except (TypeError, ValueError):
+            pass
+        return sent
+
+    def _build_local_area_analysis_from_data(
+        self,
+        dataset: Dict,
+        county: str,
+        state: str,
+        property_type: str,
+    ) -> str:
+        """Local Area Analysis from Esri 1/3/5-mile ring tables."""
+        rings = dataset.get("rings") or {}
+        r1 = rings.get("1") or rings.get(1) or {}
+        r3 = rings.get("3") or rings.get(3) or {}
+        r5 = rings.get("5") or rings.get(5) or {}
+        if not r1 and not r3 and not r5:
+            return ""
+
+        def _ring_bits(label: str, ring: Dict) -> str:
+            bits = []
+            pop = ring.get("pop_2024")
+            hh = ring.get("hh_2024")
+            med = ring.get("median_hh_income")
+            owner = ring.get("owner_pct")
+            if pop is not None:
+                bits.append(f"population of about {self._fmt_int_commas(pop)}")
+            if hh is not None:
+                bits.append(f"{self._fmt_int_commas(hh)} households")
+            if med is not None:
+                bits.append(f"median household income near ${self._fmt_int_commas(med)}")
+            if owner is not None:
+                bits.append(f"owner-occupancy of about {self._fmt_pct_plain(owner)}")
+            if not bits:
+                return ""
+            if len(bits) == 1:
+                joined = bits[0]
+            elif len(bits) == 2:
+                joined = f"{bits[0]} and {bits[1]}"
+            else:
+                joined = ", ".join(bits[:-1]) + f", and {bits[-1]}"
+            return f"Within {label}, Esri reports a {joined}"
+
+        sentences = []
+        for label, ring in (
+            ("1 mile", r1),
+            ("3 miles", r3),
+            ("5 miles", r5),
+        ):
+            bit = _ring_bits(label, ring if isinstance(ring, dict) else {})
+            if bit:
+                sentences.append(bit + ".")
+
+        if not sentences:
+            return ""
+
+        ptype = (property_type or "commercial").lower()
+        sentences.append(
+            f"These trade-area demographics support demand for nearby {ptype} uses "
+            f"in {county}, {state}."
+        )
+        return " ".join(sentences)
+
+    def _build_demographic_overview_from_data(
+        self,
+        dataset: Dict,
+        county: str,
+        state: str,
+        property_type: str,
+    ) -> str:
+        """Demographic Overview using only Esri table figures (no invented stats)."""
+        pop = dataset.get("population") or {}
+        hh = dataset.get("households") or {}
+        tenure = dataset.get("tenure") or {}
+        rings = dataset.get("rings") or {}
+        r1 = rings.get("1") or rings.get(1) or {}
+
+        pop_cy = (pop.get("2025") or {}).get("county")
+        hh_cy = (hh.get("2024") or {}).get("county")
+        hh_cagr = (hh.get("cagr") or {}).get("county")
+        owner_c = (tenure.get("owner") or {}).get("county")
+        med_inc = r1.get("median_hh_income") if isinstance(r1, dict) else None
+
+        if pop_cy is None and hh_cy is None:
+            return ""
+
+        county_label = county if county.lower().endswith("county") else f"{county} County"
+        ptype = (property_type or "commercial").lower()
+        parts = [
+            f"The subject benefits from the demographic profile of {county_label}, {state}"
+        ]
+        detail = []
+        if pop_cy is not None:
+            detail.append(
+                f"a current (2025) county population of about {self._fmt_int_commas(pop_cy)}"
+            )
+        if hh_cy is not None:
+            hh_bit = f"approximately {self._fmt_int_commas(hh_cy)} households in 2024"
+            if hh_cagr is not None:
+                hh_bit += (
+                    f", projected to change by about {self._fmt_pct_plain(hh_cagr)} annually "
+                    f"through 2029"
+                )
+            detail.append(hh_bit)
+        if detail:
+            if len(detail) == 1:
+                parts[0] += f", including {detail[0]}"
+            else:
+                parts[0] += f", including {detail[0]} and {detail[1]}"
+        parts[0] += "."
+
+        extras = []
+        if owner_c is not None:
+            extras.append(
+                f"Owner-occupancy in the county is about {self._fmt_pct_plain(owner_c)}"
+            )
+        if med_inc is not None:
+            extras.append(
+                f"median household income within one mile is near "
+                f"${self._fmt_int_commas(med_inc)}"
+            )
+        if extras:
+            parts.append(
+                (" and ".join(extras) if len(extras) == 2 else extras[0])
+                + f", supporting local {ptype} demand."
+            )
+        else:
+            parts.append(
+                f"These fundamentals help underwrite demand for nearby {ptype} uses."
+            )
+        return " ".join(parts)
+
+    def _build_population_analysis_from_data(
+        self, dataset: Dict, county: str, state: str
+    ) -> str:
+        """Population Analysis paragraph from Esri population / density tables."""
+        pop = dataset.get("population") or {}
+        density = dataset.get("density") or {}
+        pop_2020_c = (pop.get("2020") or {}).get("county")
+        pop_2025_c = (pop.get("2025") or {}).get("county")
+        pop_2020_s = (pop.get("2020") or {}).get("state")
+        pop_2025_s = (pop.get("2025") or {}).get("state")
+        dens_2025_c = (density.get("2025") or {}).get("county")
+        dens_2025_s = (density.get("2025") or {}).get("state")
+        dens_2025_us = (density.get("2025") or {}).get("us")
+
+        if pop_2020_c is None or pop_2025_c is None:
+            return ""
+
+        county_label = county if county.lower().endswith("county") else f"{county} County"
+        source = dataset.get("demographics_source") or "Esri GeoEnrichment"
+        county_cagr = self._cagr(pop_2020_c, pop_2025_c, years=5)
+        state_cagr = self._cagr(pop_2020_s, pop_2025_s, years=5)
+
+        parts = [
+            f"According to {source}, {county_label} had a 2020 total population of "
+            f"{self._fmt_int_commas(pop_2020_c)}"
+        ]
+        if county_cagr is not None:
+            parts[0] += (
+                f" and experienced an annual growth rate of {self._fmt_pct_plain(county_cagr)}"
+            )
+            if state_cagr is not None:
+                cmp = "higher" if county_cagr > state_cagr else (
+                    "lower" if county_cagr < state_cagr else "similar"
+                )
+                parts[0] += (
+                    f", which was {cmp} than the {state} annual growth rate of "
+                    f"{self._fmt_pct_plain(state_cagr)}"
+                )
+            parts[0] += "."
+        else:
+            parts[0] += "."
+
+        if pop_2025_s is not None and float(pop_2025_s) > 0:
+            share = (float(pop_2025_c) / float(pop_2025_s)) * 100.0
+            parts.append(
+                f"The county accounted for {share:.1f}% of the total {state} population "
+                f"({self._fmt_int_commas(pop_2025_s)})."
+            )
+        parts.append(
+            f"Current (2025) county population is estimated at "
+            f"{self._fmt_int_commas(pop_2025_c)}."
+        )
+
+        if dens_2025_c is not None:
+            dens_sent = (
+                f"Within the county the population density was "
+                f"{self._fmt_int_commas(dens_2025_c)} people per square mile"
+            )
+            if dens_2025_s is not None:
+                dens_sent += (
+                    f" compared to the {state} population density of "
+                    f"{self._fmt_int_commas(dens_2025_s)} people per square mile"
+                )
+            if dens_2025_us is not None:
+                dens_sent += (
+                    f" and the United States population density of "
+                    f"{self._fmt_int_commas(dens_2025_us)} people per square mile"
+                )
+            dens_sent += "."
+            parts.append(dens_sent)
+
+        return " ".join(parts)
+
+    def _build_employment_analysis_from_data(
+        self, dataset: Dict, county: str, state: str
+    ) -> str:
+        """Employment paragraph from the employment history table figures only."""
+        history = dataset.get("employment_history") or []
+        rows = sorted(
+            [r for r in history if r.get("year") is not None],
+            key=lambda r: int(r["year"]),
+        )
+        if len(rows) < 2:
+            return ""
+
+        county_label = county if county.lower().endswith("county") else f"{county} County"
+
+        def _avg_yoy(key: str, n: int = 3):
+            vals = []
+            for rec in rows[-n:]:
+                raw = rec.get(key)
+                if raw is None or raw == "":
+                    continue
+                try:
+                    vals.append(float(raw))
+                except (TypeError, ValueError):
+                    continue
+            if not vals:
+                return None
+            return round(sum(vals) / len(vals), 1)
+
+        state_avg = _avg_yoy("state_emp_yoy", 3)
+        county_avg = _avg_yoy("county_emp_yoy", 3)
+        last = rows[-1]
+        prev = rows[-2]
+        y0 = int(prev["year"])
+        y1 = int(last["year"])
+
+        def _unemp_delta(key: str):
+            try:
+                a = float(prev.get(key))
+                b = float(last.get(key))
+                return round(b - a, 1)
+            except (TypeError, ValueError):
+                return None
+
+        state_u_delta = _unemp_delta("state_unemp")
+        county_u_delta = _unemp_delta("county_unemp")
+        us_u = last.get("us_unemp")
+        county_u = last.get("county_unemp")
+
+        sentences = []
+        if state_avg is not None and county_avg is not None:
+            def _emp_verb(avg: float) -> str:
+                return "increased" if avg >= 0 else "decreased"
+
+            sentences.append(
+                f"Total employment has {_emp_verb(state_avg)} annually over the past three "
+                f"years in {state} by roughly {self._fmt_pct_plain(abs(state_avg))} and "
+                f"has {_emp_verb(county_avg)} by roughly "
+                f"{self._fmt_pct_plain(abs(county_avg))} in {county_label}."
+            )
+        elif state_avg is not None:
+            verb = "increased" if state_avg >= 0 else "decreased"
+            sentences.append(
+                f"Total employment has {verb} annually over the past three years in "
+                f"{state} by roughly {self._fmt_pct_plain(abs(state_avg))}."
+            )
+
+        if state_u_delta is not None and county_u_delta is not None:
+            def _u_phrase(delta: float, place: str) -> str:
+                mag = abs(delta)
+                if delta < 0:
+                    return f"fell in {place} by about {self._fmt_pct_plain(mag)}"
+                if delta > 0:
+                    return f"rose in {place} by about {self._fmt_pct_plain(mag)}"
+                return f"was unchanged in {place}"
+
+            u_sent = (
+                f"From {y0} to {y1} unemployment {_u_phrase(state_u_delta, state)} and "
+                f"{_u_phrase(county_u_delta, county_label)}"
+            )
+            try:
+                if us_u is not None and county_u is not None and float(county_u) < float(us_u):
+                    u_sent += (
+                        f", with the county's rate remaining below the national average "
+                        f"of {self._fmt_pct_plain(us_u)}"
+                    )
+                elif us_u is not None:
+                    u_sent += (
+                        f", compared with a national unemployment rate of "
+                        f"{self._fmt_pct_plain(us_u)}"
+                    )
+            except (TypeError, ValueError):
+                pass
+            u_sent += "."
+            sentences.append(u_sent)
+
+        # Do not invent month-over-month figures — the employment table is annual only.
+        if last.get("state_emp") is not None and last.get("county_emp") is not None:
+            sentences.append(
+                f"As of {y1}, total employment stood at approximately "
+                f"{self._fmt_int_commas(last.get('state_emp'))} in {state} and "
+                f"{self._fmt_int_commas(last.get('county_emp'))} in {county_label}."
+            )
+
+        return " ".join(sentences)
+
     def _overlay_esri_county(self, dataset: Dict, county_demo: Dict) -> None:
         """Legacy point-level overlay — employment only (never county population).
 
@@ -1164,6 +1723,19 @@ Rules:
             return float(text)
         except (TypeError, ValueError):
             return None
+
+    @staticmethod
+    def _format_display_number(value) -> str:
+        """Format numeric fields with thousands separators (e.g. 24500 -> 24,500)."""
+        text = str(value).strip() if value is not None else ""
+        if not text:
+            return ""
+        n = ComprehensivePropertyReportGenerator._to_number(value)
+        if n is None:
+            return text
+        if float(n).is_integer():
+            return f"{int(round(n)):,}"
+        return f"{n:,.2f}".rstrip("0").rstrip(".")
 
     def _generate_bov_demographics_ai(self, county: str, state: str, property_type: str) -> Dict:
         """Generate a complete demographic + valuation dataset as JSON via AI."""
@@ -2302,7 +2874,7 @@ Rules:
             '{{shape}}': na(property_data.shape),
             '{{Access}}': na(property_data.access),
             '{{Exposure}}': na(property_data.exposure),
-            '{{lot_area}}': na(property_data.lot_area),
+            '{{lot_area}}': self._format_display_number(property_data.lot_area) or "N/A",
             '{{acres}}': na(property_data.acres),
             '{{recorded_sale_date}}': na(property_data.recorded_sale_date),
             '{{zoning}}': na(property_data.zoning),
@@ -2318,6 +2890,8 @@ Rules:
             '{{size_and_topography}}': property_data.size_and_topography,
             '{{population_analysis}}': property_data.population_analysis,
             '{{household_trends}}': property_data.household_trends,
+            '{{housing_tenure}}': property_data.housing_tenure,
+            '{{local_area_analysis}}': property_data.local_area_analysis,
             '{{employment_analysis}}': property_data.employment_analysis,
             '{{economic_factors}}': property_data.economic_factors,
             '{{community_services}}': property_data.community_services,
@@ -2511,10 +3085,12 @@ Rules:
         logger.info("Inserted blank paragraph before %s", heading)
 
     def _normalize_toc_leaders(self, doc: Document) -> None:
-        """Force TOC rows to image-2 style: title | single middle line | page.
+        """TOC rows: title | mid-height underscore line | page.
 
-        Does NOT hardcode page numbers — those are filled after save from the
-        actual section locations via `_refresh_toc_page_numbers`.
+        Underscore glyphs sit on the baseline by default. Raising the leader
+        run with w:position lifts the line into the vertical middle of the
+        title/page text. Page numbers are filled after save via
+        `_refresh_toc_page_numbers`.
         """
         from docx.enum.text import WD_ALIGN_PARAGRAPH
         from docx.enum.table import WD_CELL_VERTICAL_ALIGNMENT
@@ -2529,7 +3105,6 @@ Rules:
         if "executive" not in first:
             return
 
-        # TOC label only — page #s stay blank until Word resolves real pages
         titles = [
             "Executive Summary",
             "Subject Photos",
@@ -2537,6 +3112,12 @@ Rules:
             "Comparables",
             "Certification",
         ]
+        # CLIENT-style column widths (twips)
+        col_widths = ("2985", "6192", "1078")
+        leader = "_" * 54
+        toc_font_pt = 11
+        # Half-points above baseline so underscore sits mid-glyph at 11pt
+        leader_raise = 9
 
         def clear_pbdr(p):
             pPr = p._p.find(qn("w:pPr"))
@@ -2546,8 +3127,19 @@ Rules:
             if pBdr is not None:
                 pPr.remove(pBdr)
 
-        def style_run(run):
-            run.font.size = Pt(11)
+        def set_tight_spacing(p):
+            pPr = p._p.get_or_add_pPr()
+            spacing = pPr.find(qn("w:spacing"))
+            if spacing is None:
+                spacing = OxmlElement("w:spacing")
+                pPr.append(spacing)
+            spacing.set(qn("w:before"), "0")
+            spacing.set(qn("w:after"), "0")
+            spacing.set(qn("w:line"), "240")
+            spacing.set(qn("w:lineRule"), "auto")
+
+        def style_run(run, size_pt=toc_font_pt, raise_hp=0):
+            run.font.size = Pt(size_pt)
             run.font.color.rgb = RGBColor(0xFF, 0xFF, 0xFF)
             run.font.underline = False
             rPr = run._r.get_or_add_rPr()
@@ -2559,50 +3151,95 @@ Rules:
                 color = OxmlElement("w:color")
                 rPr.append(color)
             color.set(qn("w:val"), "FFFFFF")
+            color.set(qn("w:themeColor"), "background1")
+            half = str(int(size_pt * 2))
+            for tag in ("sz", "szCs"):
+                el = rPr.find(qn(f"w:{tag}"))
+                if el is None:
+                    el = OxmlElement(f"w:{tag}")
+                    rPr.append(el)
+                el.set(qn("w:val"), half)
+            pos = rPr.find(qn("w:position"))
+            if raise_hp:
+                if pos is None:
+                    pos = OxmlElement("w:position")
+                    rPr.append(pos)
+                pos.set(qn("w:val"), str(raise_hp))
+            elif pos is not None:
+                rPr.remove(pos)
 
-        def middle_border(p):
-            clear_pbdr(p)
-            pPr = p._p.get_or_add_pPr()
-            pBdr = OxmlElement("w:pBdr")
-            bottom = OxmlElement("w:bottom")
-            bottom.set(qn("w:val"), "single")
-            bottom.set(qn("w:sz"), "12")
-            bottom.set(qn("w:space"), "6")
-            bottom.set(qn("w:color"), "FFFFFF")
-            pBdr.append(bottom)
-            pPr.append(pBdr)
+        def make_cell(width_twips: str):
+            tc = OxmlElement("w:tc")
+            tcPr = OxmlElement("w:tcPr")
+            tcW = OxmlElement("w:tcW")
+            tcW.set(qn("w:w"), width_twips)
+            tcW.set(qn("w:type"), "dxa")
+            tcPr.append(tcW)
+            vAlign = OxmlElement("w:vAlign")
+            vAlign.set(qn("w:val"), "center")
+            tcPr.append(vAlign)
+            tc.append(tcPr)
+            p = OxmlElement("w:p")
+            tc.append(p)
+            return tc
+
+        def rebuild_row_cells(row):
+            """Force exactly 3 cells (unmerge prior tab-leader layout)."""
+            tr = row._tr
+            for tc in list(tr.findall(qn("w:tc"))):
+                tr.remove(tc)
+            for width in col_widths:
+                tr.append(make_cell(width))
 
         for ri, title in enumerate(titles):
             if ri >= len(table.rows):
                 break
             row = table.rows[ri]
-            # Keep existing page text as a temporary placeholder if present
-            existing_page = (row.cells[2].text or "").strip() or "—"
 
-            c0 = row.cells[0]
-            c0.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.CENTER
-            p0 = c0.paragraphs[0]
-            clear_pbdr(p0)
-            p0.alignment = WD_ALIGN_PARAGRAPH.LEFT
-            p0.clear()
-            style_run(p0.add_run(title))
+            # Preserve page from prior layouts before rebuilding cells
+            raw0 = (row.cells[0].text or "").replace("\x07", "").replace("\r", "")
+            if "\t" in raw0:
+                existing_page = raw0.split("\t", 1)[1].strip() or "—"
+            else:
+                try:
+                    existing_page = (
+                        (row.cells[2].text or "").strip().replace("\x07", "") or "—"
+                    )
+                except Exception:
+                    existing_page = "—"
 
-            c1 = row.cells[1]
-            c1.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.CENTER
-            p1 = c1.paragraphs[0]
-            p1.clear()
-            style_run(p1.add_run(" "))
-            middle_border(p1)
+            trPr = row._tr.get_or_add_trPr()
+            trH = trPr.find(qn("w:trHeight"))
+            if trH is None:
+                trH = OxmlElement("w:trHeight")
+                trPr.append(trH)
+            trH.set(qn("w:val"), "1440")
+            trH.set(qn("w:hRule"), "atLeast")
 
-            c2 = row.cells[2]
-            c2.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.CENTER
-            p2 = c2.paragraphs[0]
-            clear_pbdr(p2)
-            p2.alignment = WD_ALIGN_PARAGRAPH.RIGHT
-            p2.clear()
-            style_run(p2.add_run(existing_page))
+            rebuild_row_cells(row)
+            # Re-bind cells after XML rebuild
+            cells = row.cells
 
-        logger.info("Normalized TOC leaders to single middle-line style")
+            specs = (
+                (0, title, WD_ALIGN_PARAGRAPH.LEFT, 0),
+                (1, leader, WD_ALIGN_PARAGRAPH.LEFT, leader_raise),
+                (2, existing_page, WD_ALIGN_PARAGRAPH.RIGHT, 0),
+            )
+            for ci, text, align, raise_hp in specs:
+                cell = cells[ci]
+                cell.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.CENTER
+                p = cell.paragraphs[0]
+                clear_pbdr(p)
+                set_tight_spacing(p)
+                p.alignment = align
+                p.clear()
+                style_run(p.add_run(text), raise_hp=raise_hp)
+
+        logger.info(
+            "Normalized TOC leaders (%spt, mid-height raised underscores +%s hp)",
+            toc_font_pt,
+            leader_raise,
+        )
 
     # TOC label -> body heading used to resolve the real page number
     TOC_SECTION_HEADINGS = (
@@ -2686,20 +3323,35 @@ Rules:
 
             for row_idx in range(1, toc_table.Rows.Count + 1):
                 try:
-                    label = (toc_table.Cell(row_idx, 1).Range.Text or "").strip()
-                    # Word cell text includes \r\x07
-                    label = label.replace("\r", "").replace("\x07", "").strip()
+                    cell = toc_table.Cell(row_idx, 1)
+                    raw = (cell.Range.Text or "").replace("\r", "").replace("\x07", "")
+                    if "\t" in raw:
+                        label = raw.split("\t", 1)[0].strip()
+                    else:
+                        label = raw.strip()
                     page_num = resolved.get(label)
                     if page_num is None:
                         continue
-                    cell = toc_table.Cell(row_idx, 3)
-                    rng = cell.Range
-                    # Exclude the end-of-cell marker so formatting stays intact
-                    rng.MoveEnd(Unit=1, Count=-1)  # wdCharacter=1
-                    rng.Text = str(page_num)
-                    rng.Font.Color = 16777215  # white
-                    rng.Font.Size = 11
-                    cell.Range.ParagraphFormat.Alignment = 2  # wdAlignParagraphRight
+
+                    para = cell.Range.Paragraphs(1)
+                    para_text = (para.Range.Text or "").replace("\r", "").replace("\x07", "")
+                    tab_idx = para_text.find("\t")
+                    if tab_idx >= 0:
+                        page_start = para.Range.Start + tab_idx + 1
+                        page_end = para.Range.End - 1
+                        page_rng = doc.Range(page_start, page_end)
+                        page_rng.Text = str(page_num)
+                        page_rng.Font.Color = 16777215  # white
+                        page_rng.Font.Size = 11
+                    else:
+                        # Legacy 3-column TOC
+                        page_cell = toc_table.Cell(row_idx, 3)
+                        rng = page_cell.Range
+                        rng.MoveEnd(Unit=1, Count=-1)
+                        rng.Text = str(page_num)
+                        rng.Font.Color = 16777215
+                        rng.Font.Size = 11
+                        page_cell.Range.ParagraphFormat.Alignment = 2
                 except Exception as cell_exc:
                     logger.warning("TOC row %s update failed: %s", row_idx, cell_exc)
 
