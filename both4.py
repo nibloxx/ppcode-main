@@ -168,7 +168,7 @@ class ComprehensivePropertyReportGenerator:
         street_view_path = None
         
         try:
-            logger.info("Fetching aerial image via Google Static Maps (Esri fallback)...")
+            logger.info("Fetching aerial image for %s @ (%.6f, %.6f)...", address, lat, lng)
             aerial_filename = f"aerial_{timestamp}.jpg"
             aerial_path = self.location_service.get_aerial_image(
                 lat, lng, self.images_dir / aerial_filename
@@ -176,7 +176,7 @@ class ComprehensivePropertyReportGenerator:
             if aerial_path:
                 logger.info("Aerial image saved: %s", aerial_path)
 
-            logger.info("Fetching Street View image via Google...")
+            logger.info("Fetching Street View for address %r @ (%.6f, %.6f)...", address, lat, lng)
             street_view_filename = f"street_view_{timestamp}.jpg"
             street_view_path = self.location_service.get_street_view_image(
                 address,
@@ -338,6 +338,8 @@ average asking lease rate about ${market_data.get('avg_lease_rate', 'n/a')}/SF, 
 
 Cover local population and employment growth drivers, demand for {property_type} space, and current leasing
 dynamics (e.g., sublease availability, flight to quality, hybrid-work effects where relevant).
+Do NOT cite or mention CoStar / Costar / Co-Star by name. Attribute market conditions only to public
+brokerage reports (e.g. Colliers, CBRE, JLL) or generic public sources if needed.
 Plain text only. No markdown, no bullet points, no headings."""
         return self._get_ai_response(prompt)
 
@@ -368,6 +370,7 @@ Rules:
 - Separate each item with a blank line.
 - Do NOT output Direct/Sublease/Total vacancy line items.
 - Do NOT invent other counties/states. Ground everything in {county}, {state} / its metro.
+- NEVER cite or mention CoStar / Costar / Co-Star.
 """
         return self._get_ai_response(prompt)
 
@@ -472,6 +475,30 @@ Rules:
         text = re.sub(r"(?m)^#{1,6}\s*", "", text)
         return text
 
+    @staticmethod
+    def _scrub_costar_citations(text: str) -> str:
+        """Remove CoStar attributions from report body text (legal risk).
+
+        User-uploaded CoStar comps are fine; citing CoStar as a market-data
+        source in disclaimers / narrative is not.
+        """
+        if not text:
+            return text or ""
+        # Replace common "CoStar – …" / "CoStar - …" source bullets with Colliers
+        text = re.sub(
+            r"(?im)^(\s*•\s*)CoStar\b([^\n]*)",
+            r"\1Colliers International\2",
+            text,
+        )
+        text = re.sub(
+            r"(?i)\bCoStar\b(\s*[–—-]\s*)",
+            r"Colliers International\1",
+            text,
+        )
+        # Any remaining bare CoStar mentions in prose → generic public brokerage
+        text = re.sub(r"(?i)\bCo-?Star\b", "public brokerage market reports", text)
+        return text
+
     def _generate_data_sources(self, context: str = "", property_type: str = "", market_data: Dict = None) -> str:
         """Generate a current, market-relevant data sources list via AI."""
         market_data = market_data or {}
@@ -487,8 +514,8 @@ Match this EXACT structure (plain text only — no markdown):
 
 This analysis relies on multiple public sources:
 
-• CoStar – {county}/{state} metro {property_type} Market {quarter} (vacancy rates, rental rates, absorption)
-• CBRE / JLL / similar brokerage – {property_type} Market Report {quarter} (market trends and leasing activity)
+• Colliers International – {county}/{state} metro {property_type} Market Report {quarter} (vacancy rates, rental rates, absorption)
+• CBRE / JLL / similar public brokerage – {property_type} Market Report {quarter} (market trends and leasing activity)
 • U.S. Census Bureau – latest population, income, and housing statistics for {county}, {state}
 • Esri Business Analyst / GeoEnrichment – current demographic and consumer spending data
 • U.S. Bureau of Labor Statistics – current employment and unemployment data
@@ -500,12 +527,14 @@ Rules:
 - Do NOT use a numbered list (no "1.", "2.", "Sources Used:").
 - Keep each bullet to one line. Sources must be current ({year} / {quarter}), not older than two years.
 - Do NOT invent Utah-specific sources unless the property is in Utah.
+- NEVER cite, name, or attribute anything to CoStar / Costar / Co-Star. CoStar is forbidden as a source.
+- Only cite publicly available brokerage quarterly reports (Colliers, CBRE, JLL, Newmark, etc.), census/BLS/Esri, and public assessor records.
 """
         text = self._get_ai_response(prompt)
         # Force CLIENT-style bullets even if the model returns "1. 2. 3."
         text = text.replace("Sources Used:", "This analysis relies on multiple public sources:")
         text = re.sub(r"(?m)^\s*\d+\.\s+", "• ", text)
-        return text
+        return self._scrub_costar_citations(text)
 
     @staticmethod
     def _ctx_value(context: str, label: str) -> str:
@@ -539,8 +568,12 @@ Rules:
             'market_recommendations': self._generate_market_recommendations(context, property_type, market_data),
             'market_data_sources': self._generate_data_sources(context, property_type, market_data)
         }
-        # Word shows literal **bold** if markdown slips through — strip it
-        return {k: self._strip_markdown(v) for k, v in sections.items()}
+        # Word shows literal **bold** if markdown slips through — strip it.
+        # Also scrub any CoStar attributions (never cite CoStar as a market source).
+        return {
+            k: self._scrub_costar_citations(self._strip_markdown(v))
+            for k, v in sections.items()
+        }
 
     def generate_comprehensive_content(self, address: str, property_data: PropertyReportData) -> PropertyReportData:
         """
@@ -636,10 +669,20 @@ Rules:
         # CLIENT layout: SALES CONCLUSION heading + OPINIONS OF VALUE table only
         # (no long narrative between/after those elements)
         property_data.sales_conclusion = ""
+        stats = self._comp_psf_stats(property_data.comps)
+        recon_extra = ""
+        if stats:
+            recon_extra = (
+                f" You MUST cite the comparable $/SF range as "
+                f"${stats['min']:.2f} to ${stats['max']:.2f} and the average "
+                f"${stats['avg']:.2f}/SF from {int(stats['count'])} uploaded comps. "
+                f"Do not invent other $/SF figures."
+            )
         property_data.reconciliation_summary = self._get_ai_response(
             f"Write 2 short sentences for the RECONCILIATION TABLE narrative (above the valuation grid). "
             f"Mention the comparable $/SF range when comps are available and that the sales comparison "
             f"approach supports the opinion of value for this {property_data.property_type}. "
+            f"{recon_extra}\n"
             f"Context:\n{context}\n{comp_context}"
             f"Plain text only. Keep under 60 words.",
         )
@@ -652,7 +695,8 @@ Rules:
     def _format_comp_context(comps: List[Any]) -> str:
         if not comps:
             return ""
-        lines = ["Comparable sales from uploaded CoStar PDF:"]
+        # Do not name CoStar in AI context — models can echo it into report prose.
+        lines = ["Comparable sales from user-uploaded comps:"]
         for comp in sorted(comps, key=lambda c: getattr(c, "comp_number", 0))[:6]:
             lines.append(
                 f"- Comp {getattr(comp, 'comp_number', '?')}: {getattr(comp, 'address', '')}, "
@@ -660,7 +704,49 @@ Rules:
                 f"{getattr(comp, 'sale_price_sf', 'N/A')}/SF, "
                 f"{getattr(comp, 'comp_sf', '')} SF"
             )
+        stats = ComprehensivePropertyReportGenerator._comp_psf_stats(comps)
+        if stats:
+            lines.append(
+                f"Computed from uploaded comps: avg ${stats['avg']:.2f}/SF "
+                f"(range ${stats['min']:.2f}–${stats['max']:.2f}, n={stats['count']}). "
+                f"Use ONLY these figures for any $/SF discussion."
+            )
         return "\n".join(lines) + "\n"
+
+    @staticmethod
+    def _comp_psf_stats(comps: List[Any]) -> Optional[Dict[str, float]]:
+        """Average / min / max Sale Price/SF from user-uploaded comps.
+
+        Prefers extracted Sale Price/SF; falls back to Sale Price ÷ Comp SF when
+        needed. Returns None when no usable $/SF values are present.
+        """
+        values: List[float] = []
+        for comp in comps or []:
+            psf = ComprehensivePropertyReportGenerator._to_number(
+                getattr(comp, "sale_price_sf", None)
+            )
+            if psf is None or psf <= 0:
+                price = ComprehensivePropertyReportGenerator._to_number(
+                    getattr(comp, "sale_price", None)
+                )
+                sf = ComprehensivePropertyReportGenerator._to_number(
+                    getattr(comp, "comp_sf", None)
+                )
+                if price and sf and sf > 0:
+                    psf = price / sf
+            if psf is not None and psf > 0:
+                values.append(float(psf))
+
+        if not values:
+            return None
+
+        avg = sum(values) / len(values)
+        return {
+            "avg": round(avg, 2),
+            "min": round(min(values), 2),
+            "max": round(max(values), 2),
+            "count": float(len(values)),
+        }
 
     def _build_reconciliation_notes(self, property_data: "PropertyReportData") -> str:
         """One-line NOTES cell for the valuation grid (CLIENT style)."""
@@ -684,6 +770,13 @@ Rules:
             rounded = "the concluded market value"
 
         if n_comps > 0:
+            stats = self._comp_psf_stats(comps)
+            if stats:
+                return (
+                    f"The sales comparison approach yields a value of {rounded} "
+                    f"based on the average ${stats['avg']:,.2f}/SF from "
+                    f"{int(stats['count'])} comparables."
+                )
             return (
                 f"The sales comparison approach yields a value of {rounded} "
                 f"based on the average $/SF from {n_comps} comparables."
@@ -1041,18 +1134,52 @@ Rules:
 
         dataset = self._generate_bov_demographics_ai(county, state, property_type)
 
-        # Use the entered GBA (Gross Building Area) to drive the valuation math
+        # Use the entered GBA (Gross Building Area) to drive the valuation math.
+        # Market $/SF MUST come from the average Sale Price/SF of uploaded comps
+        # when available — never reuse a stale AI default (e.g. 265) across reports.
         gba = self._to_number(property_data.lot_area)
         if gba:
             valuation = dataset.setdefault("valuation", {})
-            price_psf = self._to_number(valuation.get("price_psf")) or 265.0
+            comp_stats = self._comp_psf_stats(property_data.comps)
+            if comp_stats:
+                price_psf = float(comp_stats["avg"])
+                logger.info(
+                    "Valuation $/SF from uploaded comps average: $%.2f "
+                    "(min=$%.2f max=$%.2f n=%s)",
+                    price_psf,
+                    comp_stats["min"],
+                    comp_stats["max"],
+                    int(comp_stats["count"]),
+                )
+            else:
+                price_psf = self._to_number(valuation.get("price_psf"))
+                if not price_psf:
+                    price_psf = 265.0
+                    logger.warning(
+                        "No comps $/SF available — using fallback $%.2f/SF", price_psf
+                    )
+                else:
+                    logger.warning(
+                        "No comps $/SF available — using AI valuation $%.2f/SF", price_psf
+                    )
+
             valuation["building_sf"] = gba
-            valuation["price_psf"] = price_psf
-            market_value = price_psf * gba
+            valuation["price_psf"] = round(float(price_psf), 2)
+            market_value = float(price_psf) * gba
             valuation["market_value"] = market_value
             valuation["market_value_rounded"] = round(market_value / 10000) * 10000
-            valuation["value_aggressive"] = round(market_value * 1.04)
-            valuation["value_conservative"] = round(market_value * 0.96)
+
+            # Opinion band: prefer min/max of uploaded comps when we have a spread
+            if (
+                comp_stats
+                and comp_stats["max"] > comp_stats["min"]
+                and int(comp_stats["count"]) >= 2
+            ):
+                valuation["value_aggressive"] = round(float(comp_stats["max"]) * gba)
+                valuation["value_conservative"] = round(float(comp_stats["min"]) * gba)
+            else:
+                valuation["value_aggressive"] = round(market_value * 1.04)
+                valuation["value_conservative"] = round(market_value * 0.96)
 
         # Overlay real Esri ring demographics when available
         try:
@@ -1705,21 +1832,25 @@ Rules:
 
     @staticmethod
     def _to_number(value):
-        """Parse a number from strings like '24,500', '708711', or '24500 SF'."""
+        """Parse a number from strings like '$45.20/SF', '24,500', or '24500 SF'."""
         if value is None:
             return None
         try:
             text = str(value).strip()
             if not text:
                 return None
-            # Strip currency / area unit suffixes users often type into GBA
-            text = text.replace("$", "").replace(",", "")
-            for suffix in (
-                "sq. ft.", "sq ft", "sqft", "s.f.", "sf", "acres", "acre", "gba",
+            lowered = text.lower()
+            for token in (
+                "/psf", " per psf", " psf",
+                "/sf", " per sf", " / sf", " sf",
+                "sq. ft.", "sq ft", "sqft", "s.f.",
+                "acres", "acre", "gba",
             ):
-                if text.lower().endswith(suffix):
-                    text = text[: -len(suffix)].strip()
-                    break
+                lowered = lowered.replace(token, "")
+            text = lowered.replace("$", "").replace(",", "").strip()
+            text = re.sub(r"[^0-9.\-]", "", text)
+            if not text or text in {"-", ".", "-."}:
+                return None
             return float(text)
         except (TypeError, ValueError):
             return None
@@ -1859,11 +1990,17 @@ Rules:
               "us_emp": 160000000, "us_unemp": 4.0}}
           ],
           "valuation": {{
-            "price_psf": 265.00, "building_sf": 24500,
-            "market_value": 6492500, "market_value_rounded": 6490000,
-            "value_aggressive": 6752200, "value_conservative": 6232800
+            "price_psf": null,
+            "building_sf": null,
+            "market_value": null,
+            "market_value_rounded": null,
+            "value_aggressive": null,
+            "value_conservative": null
           }}
         }}
+
+        IMPORTANT: Leave valuation.price_psf as null. Market $/SF is calculated later
+        from the average Sale Price/SF of user-uploaded comps — do NOT invent a $/SF.
         """
         try:
             response = self.openai_client.chat.completions.create(
@@ -2220,6 +2357,18 @@ Rules:
         v["{{market_value_rounded}}"] = money(val.get("market_value_rounded"))
         v["{{value_aggressive}}"] = money(val.get("value_aggressive"))
         v["{{value_conservative}}"] = money(val.get("value_conservative"))
+        gba = self._to_number(val.get("building_sf"))
+
+        def psf_label(total_val):
+            try:
+                if gba and total_val is not None and float(gba) > 0:
+                    return f"${float(total_val) / float(gba):,.2f}/PSF"
+            except (TypeError, ValueError):
+                pass
+            return "—"
+
+        v["{{value_aggressive_psf}}"] = psf_label(val.get("value_aggressive"))
+        v["{{value_conservative_psf}}"] = psf_label(val.get("value_conservative"))
 
         v["{{demographics_source}}"] = dataset.get("demographics_source", "US Census, Esri, BLS")
         v["{{address}}"] = property_data.address
@@ -2269,24 +2418,65 @@ Rules:
             "CERTIFICATION AND DISCLAIMERS",
             "OPINION OF VALUE",
         }
-        for j in range(heading_idx, len(doc.paragraphs)):
+        # Snapshot paragraph elements in the comps zone (heading exclusive → next section)
+        zone_paras = []
+        for j in range(heading_idx + 1, len(doc.paragraphs)):
             p = doc.paragraphs[j]
             upper = p.text.strip().upper()
-            if j > heading_idx and (
-                upper in stop_headings or upper.startswith("RECONCILIATION")
-            ):
+            if upper in stop_headings or upper.startswith("RECONCILIATION"):
                 break
+            zone_paras.append(p)
+
+        removed_drawings = 0
+        for p in zone_paras:
             for drawing in list(p._p.iter(qn("w:drawing"))):
                 parent = drawing.getparent()
                 if parent is not None:
                     parent.remove(drawing)
+                    removed_drawings += 1
             for pict in list(p._p.iter(qn("w:pict"))):
                 parent = pict.getparent()
                 if parent is not None:
                     parent.remove(pict)
+                    removed_drawings += 1
 
+        # Delete emptied sample paragraphs AND orphan page-breaks in the comps
+        # zone. Leaving those behind creates large blank pages (template samples
+        # were ~6–8" tall with page breaks between them).
+        # NEVER delete a paragraph that carries w:sectPr — on Prospect that
+        # paragraph links header/footer (blue bars + page numbers).
+        removed_paras = 0
+        for p in zone_paras:
+            text = (p.text or "").strip()
+            has_drawing = any(True for _ in p._p.iter(qn("w:drawing")))
+            has_pict = any(True for _ in p._p.iter(qn("w:pict")))
+            pPr = p._element.find(qn("w:pPr"))
+            has_sectpr = (
+                pPr is not None and pPr.find(qn("w:sectPr")) is not None
+            )
+            if text or has_drawing or has_pict or has_sectpr:
+                continue
+            parent = p._element.getparent()
+            if parent is not None:
+                parent.remove(p._element)
+                removed_paras += 1
+        if removed_drawings or removed_paras:
+            logger.info(
+                "Cleared comps template samples: drawings=%s empty_paras=%s",
+                removed_drawings,
+                removed_paras,
+            )
+
+        # Re-find heading after paragraph deletions (indexes shifted)
+        heading_idx = None
+        for i, p in enumerate(doc.paragraphs):
+            if "PROPERTY COMPARABLES" in p.text.upper():
+                heading_idx = i
+                break
+        if heading_idx is None:
+            return
         anchor = doc.paragraphs[heading_idx]
-        # Do not truncate — Office Comp PDFs often have many pages (2 cards each)
+        is_prospect = self._is_prospect_run(doc)
         sorted_comps = sorted(comps, key=lambda c: getattr(c, "comp_number", 0))
 
         # One image per unique CoStar page (avoids duplicating 2-card pages)
@@ -2304,27 +2494,50 @@ Rules:
             seen_paths.add(image_path)
             page_images.append(image_path)
 
+        # Prospect is a 5–7 page short form — hard-cap CoStar pages so an
+        # 11-page comps PDF cannot balloon the report to ~18 pages.
+        prospect_comp_cap = 2
+        if is_prospect and len(page_images) > prospect_comp_cap:
+            logger.info(
+                "Prospect short-form: limiting comps pages %s -> %s (template=%s)",
+                len(page_images),
+                prospect_comp_cap,
+                self.template_path,
+            )
+            page_images = page_images[:prospect_comp_cap]
+
         if page_images:
             for image_path in page_images:
                 img_p = self._insert_paragraph_after(anchor)
                 img_p.paragraph_format.space_before = Pt(0)
-                img_p.paragraph_format.space_after = Pt(4)
+                img_p.paragraph_format.space_after = Pt(2)
                 img_p.paragraph_format.line_spacing = 1.0
                 img_p.alignment = WD_ALIGN_PARAGRAPH.CENTER
                 try:
-                    width_in, height_in = self._comp_image_display_size(image_path)
-                    # Pass only width — Word keeps aspect; height is pre-capped for 2/page
-                    img_p.add_run().add_picture(image_path, width=Inches(width_in))
+                    compressed = self._compress_image_file(
+                        image_path,
+                        max_edge=900 if is_prospect else 1400,
+                        quality=52 if is_prospect else 72,
+                    )
+                    width_in, _height_in = self._comp_image_display_size(
+                        compressed, pack_tight=is_prospect
+                    )
+                    # Width drives size (aspect kept). Sizing packs ~2 short
+                    # CoStar pages per Word page; tall 2-card sheets stay 1/page.
+                    img_p.add_run().add_picture(compressed, width=Inches(width_in))
                     anchor = img_p
                 except Exception as exc:
                     logger.warning("Could not insert comp page image: %s", exc)
+            # Ensure reconciliation/certification still start on a fresh page
+            self._ensure_page_break_before_heading(doc, "RECONCILIATION TABLE")
             logger.info(
                 "Inserted %d unique CoStar page image(s) for comps", len(page_images)
             )
             return
 
         # Fallback text details when no page images
-        for comp in sorted_comps[:6]:
+        fallback_limit = 4 if is_prospect else 6
+        for comp in sorted_comps[:fallback_limit]:
             title_p = self._insert_paragraph_after(anchor)
             name = getattr(comp, "property_name", "") or "Property"
             run = title_p.add_run(name)
@@ -2361,45 +2574,61 @@ Rules:
         logger.info("Inserted %d comparable properties into BOV report", len(sorted_comps))
 
     @staticmethod
-    def _comp_image_display_size(image_path: str) -> Tuple[float, float]:
-        """Size CoStar images for readability first, then pack when they still fit.
+    def _comp_image_display_size(
+        image_path: str, pack_tight: bool = False
+    ) -> Tuple[float, float]:
+        """Size CoStar page renders to pack ~2 images per Word page when possible.
 
-        Land Comp Summary cards are landscape: height-capping to force 2/page made
-        them ~5\" wide with large side margins (tiny vs native CoStar cards). Prefer
-        full content width (~6.5\") so text stays legible; still cap height when that
-        does not force a narrow width.
+        - Tall/portrait pages (already 2 cards on one CoStar sheet): nearly full
+          page, 1/Word page.
+        - Short/single-card pages: height-capped so two stack on one Word page
+          instead of leaving a large blank under each image.
+        - pack_tight (Prospect): slightly smaller so 2 CoStar pages fit in the
+          5–7 page short-form budget.
         """
         max_width = 6.5
-        # Soft cap — two short cards can still stack; tall pages stay full-width
-        soft_max_height = 4.95
-        min_readable_width = 6.0
+        # Usable body height is ~9"; leave a little slack for heading/spacing
+        pack_height = 3.6 if pack_tight else 4.15  # two of these fit on one page
+        full_page_height = 7.8 if pack_tight else 8.6
+        min_pack_width = 5.0
         try:
             from PIL import Image
 
             with Image.open(image_path) as im:
                 w, h = im.size
             if not w or not h:
-                return max_width, soft_max_height
+                return max_width, pack_height
             aspect = h / float(w)
 
-            # Start at full content width
             width = max_width
             height = width * aspect
 
-            if height > soft_max_height:
-                capped_h = soft_max_height
-                capped_w = capped_h / aspect
-                # Only shrink if we stay near full width; otherwise keep full width
-                # (one large card beats two illegible miniatures)
-                if capped_w >= min_readable_width:
-                    width, height = capped_w, capped_h
-                else:
-                    width = max_width
-                    height = width * aspect
+            # Portrait CoStar sheets already show 2 comps — keep one per Word page
+            if aspect >= 1.12:
+                if height > full_page_height:
+                    height = full_page_height
+                    width = height / aspect
+                    if width > max_width:
+                        width = max_width
+                        height = width * aspect
+                return round(width, 3), round(height, 3)
 
+            if height <= pack_height + 0.15:
+                # Already short enough to stack two per page
+                return round(width, 3), round(height, 3)
+
+            # Landscape / trimmed single-card — shrink to pack two per page
+            height = pack_height
+            width = height / aspect
+            if width < min_pack_width:
+                width = min_pack_width
+                height = width * aspect
+            if width > max_width:
+                width = max_width
+                height = width * aspect
             return round(width, 3), round(height, 3)
         except Exception:
-            return max_width, soft_max_height
+            return max_width, pack_height
 
     def _fill_employment_table(self, doc: Document, dataset: Dict, county: str, state: str) -> None:
         """Fill the employment table with recent-year history while keeping compact cell styles.
@@ -2575,21 +2804,61 @@ Rules:
         logger.info("Filled employment table with %d recent-year records", len(rows_data))
 
     def _sweep_remaining_placeholders(self, doc: Document, replacements: Dict[str, str]) -> None:
-        """Replace any leftover {{placeholders}} still present in the document XML."""
+        """Replace any leftover {{placeholders}} still present in the document XML.
+
+        IMPORTANT: skip paragraphs inside w:txbxContent. Floating cover textboxes
+        are nested under body paragraphs as drawings; joining all descendant w:t
+        nodes would mash Date / property name / PREPARED BY into one box.
+        Textboxes are handled by `_replace_in_textboxes`.
+        """
         import re
         from docx.oxml.ns import qn
 
         pattern = re.compile(r"\{\{[^}]+\}\}")
         w_t = qn("w:t")
+        w_p = qn("w:p")
+        w_txbx = qn("w:txbxContent")
         replaced = 0
+
+        def _inside_textbox(el) -> bool:
+            parent = el.getparent()
+            while parent is not None:
+                if parent.tag == w_txbx:
+                    return True
+                parent = parent.getparent()
+            return False
+
+        def _direct_text_nodes(paragraph):
+            """w:t nodes in this paragraph that are NOT inside nested textboxes."""
+            nodes = []
+            for n in paragraph.iter(w_t):
+                if n.text and not _inside_textbox(n):
+                    # Still inside a drawing/textbox if ancestor txbx wraps us —
+                    # _inside_textbox already covers that. Also skip if any
+                    # ancestor between n and paragraph is a drawing with txbx.
+                    nodes.append(n)
+            # If paragraph itself is inside a textbox, skip entirely
+            if _inside_textbox(paragraph):
+                return []
+            # Filter: only nodes whose containing paragraph is THIS paragraph
+            # (not nested paragraphs inside drawings)
+            out = []
+            for n in nodes:
+                parent = n.getparent()
+                while parent is not None and parent.tag != w_p:
+                    parent = parent.getparent()
+                if parent is paragraph:
+                    out.append(n)
+            return out
 
         def process(root):
             nonlocal replaced
             if root is None:
                 return
-            # Rebuild paragraph text when placeholder spans multiple w:t nodes
-            for p in root.iter(qn("w:p")):
-                nodes = [n for n in p.iter(w_t) if n.text]
+            for p in root.iter(w_p):
+                if _inside_textbox(p):
+                    continue
+                nodes = _direct_text_nodes(p)
                 if not nodes:
                     continue
                 joined = "".join(n.text or "" for n in nodes)
@@ -2598,12 +2867,9 @@ Rules:
                 new_text = joined
                 for placeholder, value in replacements.items():
                     if placeholder in new_text:
-                        # Sweep writes into a single w:t — collapse newlines to spaces
-                        # so we never inject soft-break-like gaps into justified text.
                         safe = value if value is not None else "—"
                         safe = re.sub(r"\s*\n\s*", " ", str(safe)).strip()
                         new_text = new_text.replace(placeholder, safe)
-                # Anything still unmatched -> em dash so raw {{...}} never ships
                 new_text, _n = pattern.subn("—", new_text)
                 if new_text != joined:
                     nodes[0].text = new_text
@@ -2624,31 +2890,61 @@ Rules:
     def _replace_in_textboxes(self, doc: Document, replacements: Dict[str, str]):
         """Replace placeholders inside text boxes (cover, side bars) and headers/footers.
 
-        Text-box runs are not reachable via doc.paragraphs, so we walk the raw
-        w:t nodes. The templatizer keeps each placeholder within a single run, so
-        a per-node substring replace is safe.
+        Placeholders may be split across multiple w:t runs (common in the short-form
+        template). For each textbox paragraph we join runs, replace, then write back
+        into the first run — scoped per paragraph so cover boxes stay separate.
         """
+        import re
         from docx.oxml.ns import qn
 
         w_t = qn("w:t")
+        w_p = qn("w:p")
+        pattern = re.compile(r"\{\{[^}]+\}\}")
+
+        def process_textbox(txbx):
+            for p in txbx.findall(w_p):
+                # Only this paragraph's own runs (not nested)
+                nodes = []
+                for r in p.findall(qn("w:r")):
+                    for t in r.findall(w_t):
+                        if t.text is not None:
+                            nodes.append(t)
+                if not nodes:
+                    # fallback: any direct descendant w:t under this p's runs only
+                    nodes = [n for n in p.iter(w_t) if n.text is not None]
+                if not nodes:
+                    continue
+                joined = "".join(n.text or "" for n in nodes)
+                if "{{" not in joined and "PREPARED" not in joined:
+                    # Still normalize labels / allow non-placeholder textboxes
+                    if not any(ph in joined for ph in replacements):
+                        continue
+                new_text = joined
+                for placeholder, value in replacements.items():
+                    if placeholder in new_text:
+                        safe = "" if value is None else str(value)
+                        new_text = new_text.replace(placeholder, safe)
+                # Leave unmatched placeholders for a second pass only within this box
+                if "{{" in new_text:
+                    new_text = pattern.sub("—", new_text)
+                if new_text != joined:
+                    nodes[0].text = new_text
+                    if new_text.startswith(" ") or new_text.endswith(" "):
+                        nodes[0].set(qn("xml:space"), "preserve")
+                    for n in nodes[1:]:
+                        n.text = ""
+                # Preserve trailing space after PREPARED labels
+                if nodes and nodes[0].text:
+                    stripped = nodes[0].text.strip()
+                    if stripped in ("PREPARED BY:", "PREPARED FOR:"):
+                        nodes[0].text = stripped + " "
+                        nodes[0].set(qn("xml:space"), "preserve")
 
         def process(root):
             if root is None:
                 return
-            for node in root.iter(w_t):
-                if not node.text:
-                    continue
-                new_text = node.text
-                for placeholder, value in replacements.items():
-                    if placeholder in new_text:
-                        new_text = new_text.replace(placeholder, value if value is not None else "")
-                # Word drops trailing spaces unless xml:space="preserve"
-                stripped = new_text.strip()
-                if stripped in ("PREPARED BY:", "PREPARED FOR:"):
-                    new_text = stripped + " "
-                    node.set(qn("xml:space"), "preserve")
-                if new_text != node.text:
-                    node.text = new_text
+            for txbx in root.iter(qn("w:txbxContent")):
+                process_textbox(txbx)
 
         process(doc.element.body)
         for section in doc.sections:
@@ -2677,12 +2973,15 @@ Rules:
         blip_tag = qn("a:blip")
         embed_attr = qn("r:embed")
 
+        # Longest-first so {{aerial_image}} never loses to a shorter token
+        placeholders = sorted(image_map.keys(), key=len, reverse=True)
+
         for drawing in doc.element.body.iter(qn("w:drawing")):
             descr_nodes = [el for tag in descr_tags for el in drawing.iter(tag)]
             matched = None
             for el in descr_nodes:
                 descr = el.get("descr") or ""
-                for placeholder in image_map:
+                for placeholder in placeholders:
                     if placeholder in descr:
                         matched = placeholder
                         break
@@ -2692,54 +2991,262 @@ Rules:
                 continue
 
             image_path, _width = image_map[matched]
+            rid = None
+            for blip in drawing.iter(blip_tag):
+                rid = blip.get(embed_attr)
+                if rid:
+                    break
+            part = doc.part.related_parts.get(rid) if rid else None
+
             if image_path and os.path.exists(image_path):
-                rid = None
-                for blip in drawing.iter(blip_tag):
-                    rid = blip.get(embed_attr)
-                    if rid:
-                        break
-                part = doc.part.related_parts.get(rid) if rid else None
                 if part is not None:
                     try:
                         part._blob = self._image_bytes_for_part(image_path, part)
-                        logger.info(f"Swapped template image {matched} -> {image_path}")
+                        logger.info(
+                            "Swapped template image %s -> %s (%s bytes)",
+                            matched,
+                            image_path,
+                            len(part._blob),
+                        )
                     except Exception as exc:
                         logger.error(f"Image swap failed for {matched}: {exc}")
                 else:
                     logger.warning(f"No image relationship found for {matched}")
             else:
-                logger.warning(f"Image not available for {matched}: {image_path}")
+                # Cover must never keep the template's sample placeholder icon.
+                if matched == "{{main_img}}" and part is not None:
+                    part._blob = self._blank_cover_bytes(part)
+                    logger.warning(
+                        "Street View missing — placed neutral cover placeholder "
+                        "for {{main_img}} (will not keep sample aerial)"
+                    )
+                else:
+                    logger.warning(f"Image not available for {matched}: {image_path}")
 
             # Clear the placeholder from alt-text so no {{...}} survives
             for el in descr_nodes:
                 descr = el.get("descr") or ""
-                for placeholder in image_map:
+                for placeholder in placeholders:
                     descr = descr.replace(placeholder, "")
                 el.set("descr", descr)
 
+            # Remove the light-grey textbox/picture frame around the image
+            self._strip_drawing_border(drawing)
+            # Stretch nested picture to the textbox extent so no white matte shows
+            self._fit_picture_to_textbox(drawing)
+
+    @staticmethod
+    def _fit_picture_to_textbox(drawing) -> None:
+        """Make nested pic:spPr / wp:extent match the outer textbox size."""
+        from docx.oxml.ns import qn
+
+        ext = next(drawing.iter(qn("wp:extent")), None)
+        if ext is None:
+            return
+        cx, cy = ext.get("cx"), ext.get("cy")
+        if not cx or not cy:
+            return
+        pic_sppr = "{http://schemas.openxmlformats.org/drawingml/2006/picture}spPr"
+        a_xfrm = "{http://schemas.openxmlformats.org/drawingml/2006/main}xfrm"
+        a_ext = "{http://schemas.openxmlformats.org/drawingml/2006/main}ext"
+        for spPr in drawing.iter(pic_sppr):
+            xfrm = spPr.find(a_xfrm)
+            if xfrm is None:
+                continue
+            aext = xfrm.find(a_ext)
+            if aext is not None:
+                aext.set("cx", str(cx))
+                aext.set("cy", str(cy))
+        # Also sync any nested wp:extent under pic
+        for nested in drawing.iter(qn("wp:extent")):
+            nested.set("cx", str(cx))
+            nested.set("cy", str(cy))
+
+    @classmethod
+    def _strip_all_image_borders(cls, doc: Document) -> None:
+        from docx.oxml.ns import qn
+
+        markers = ("main_img", "aerial_image", "subject_photo", "Subject_photo")
+        for drawing in doc.element.body.iter(qn("w:drawing")):
+            descr = " ".join(
+                (el.get("descr") or "")
+                for tag in (qn("wp:docPr"), qn("pic:cNvPr"))
+                for el in drawing.iter(tag)
+            )
+            has_blip = next(drawing.iter(qn("a:blip")), None) is not None
+            if any(m in descr for m in markers):
+                cls._strip_drawing_border(drawing)
+                continue
+            if not has_blip:
+                continue
+            docPr = next(drawing.iter(qn("wp:docPr")), None)
+            name = (docPr.get("name") if docPr is not None else "") or ""
+            # Cover/aerial/subject frames (descr cleared after swap)
+            if name.startswith("Text Box") or name.startswith("Picture"):
+                cls._strip_drawing_border(drawing)
+
+    @staticmethod
+    def _strip_drawing_border(drawing) -> bool:
+        """Remove light-grey stroke / matte frame around cover / aerial / subject images."""
+        from lxml import etree
+        from docx.oxml.ns import qn
+
+        wps_sppr = "{http://schemas.microsoft.com/office/word/2010/wordprocessingShape}spPr"
+        pic_sppr = "{http://schemas.openxmlformats.org/drawingml/2006/picture}spPr"
+        a_ln = "{http://schemas.openxmlformats.org/drawingml/2006/main}ln"
+        a_nofill = "{http://schemas.openxmlformats.org/drawingml/2006/main}noFill"
+        a_solid = "{http://schemas.openxmlformats.org/drawingml/2006/main}solidFill"
+        a_srgb = "{http://schemas.openxmlformats.org/drawingml/2006/main}srgbClr"
+        a_alpha = "{http://schemas.openxmlformats.org/drawingml/2006/main}alpha"
+        wps_style = "{http://schemas.microsoft.com/office/word/2010/wordprocessingShape}style"
+        a_ln_ref = "{http://schemas.openxmlformats.org/drawingml/2006/main}lnRef"
+        a_effect = "{http://schemas.openxmlformats.org/drawingml/2006/main}effectLst"
+
+        changed = False
+        for spPr in list(drawing.iter(wps_sppr)) + list(drawing.iter(pic_sppr)):
+            ln = spPr.find(a_ln)
+            if ln is None:
+                ln = etree.SubElement(spPr, a_ln)
+            ln.clear()
+            ln.set("w", "0")
+            etree.SubElement(ln, a_nofill)
+            changed = True
+            solid = spPr.find(a_solid)
+            if solid is not None:
+                spPr.remove(solid)
+                if spPr.find(a_nofill) is None:
+                    etree.SubElement(spPr, a_nofill)
+                changed = True
+            for eff in list(spPr.findall(a_effect)):
+                spPr.remove(eff)
+                changed = True
+        for style in drawing.iter(wps_style):
+            ln_ref = style.find(a_ln_ref)
+            if ln_ref is not None:
+                for child in list(ln_ref):
+                    ln_ref.remove(child)
+                srgb = etree.SubElement(ln_ref, a_srgb)
+                srgb.set("val", "FFFFFF")
+                alpha = etree.SubElement(srgb, a_alpha)
+                alpha.set("val", "0")
+                changed = True
+        for ee in drawing.iter(qn("wp:effectExtent")):
+            for side in ("l", "t", "r", "b"):
+                if ee.get(side) not in (None, "0"):
+                    ee.set(side, "0")
+                    changed = True
+        return changed
+
+    @staticmethod
+    def _blank_cover_bytes(part=None) -> bytes:
+        """Valid cover-sized neutral image so Word never shows a broken-image icon."""
+        from io import BytesIO
+
+        partname = str(getattr(part, "partname", "") or "").lower() if part else ""
+        content_type = str(getattr(part, "content_type", "") or "").lower() if part else ""
+        wants_png = partname.endswith(".png") or "image/png" in content_type
+
+        try:
+            from PIL import Image
+
+            # Soft grey fill (not white) so the empty cover slot is visible but clean
+            img = Image.new("RGB", (640, 640), (230, 230, 230))
+            buf = BytesIO()
+            if wants_png:
+                img.convert("RGBA").save(buf, format="PNG", optimize=True)
+            else:
+                img.save(buf, format="JPEG", quality=70, optimize=True)
+            return buf.getvalue()
+        except Exception:
+            return ComprehensivePropertyReportGenerator._blank_jpeg_bytes(640, 640)
+
+    @staticmethod
+    def _blank_jpeg_bytes(width: int = 16, height: int = 16) -> bytes:
+        """Tiny white JPEG used as last-resort placeholder bytes."""
+        from io import BytesIO
+
+        try:
+            from PIL import Image
+
+            buf = BytesIO()
+            Image.new("RGB", (width, height), (230, 230, 230)).save(
+                buf, format="JPEG", quality=60
+            )
+            return buf.getvalue()
+        except Exception:
+            # Minimal valid JPEG
+            return (
+                b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x01\x00\x00\x01\x00\x01\x00\x00"
+                b"\xff\xdb\x00C\x00\x08\x06\x06\x07\x06\x05\x08\x07\x07\x07\t\t"
+                b"\x08\n\x0c\x14\r\x0c\x0b\x0b\x0c\x19\x12\x13\x0f\x14\x1d\x1a"
+                b"\x1f\x1e\x1d\x1a\x1c\x1c $.\' \",#\x1c\x1c(7),01444\x1f\'9=82<.342"
+                b"\xff\xc0\x00\x0b\x08\x00\x01\x00\x01\x01\x01\x11\x00\xff\xc4\x00"
+                b"\x14\x00\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"
+                b"\x00\x00\x08\xff\xc4\x00\x14\x10\x01\x00\x00\x00\x00\x00\x00\x00"
+                b"\x00\x00\x00\x00\x00\x00\x00\x00\x00\xff\xda\x00\x08\x01\x01\x00"
+                b"\x00?\x00\x7f\xbf\xff\xd9"
+            )
+
+    @staticmethod
+    def _compress_image_file(image_path: str, max_edge: int = 1400, quality: int = 72) -> str:
+        """Write a resized/JPEG-compressed copy; return path (original if compress fails)."""
+        from io import BytesIO
+        from tempfile import NamedTemporaryFile
+
+        try:
+            from PIL import Image
+
+            with Image.open(image_path) as im:
+                img = im.convert("RGB")
+                w, h = img.size
+                scale = min(1.0, float(max_edge) / float(max(w, h)))
+                if scale < 1.0:
+                    img = img.resize(
+                        (max(1, int(w * scale)), max(1, int(h * scale))),
+                        Image.LANCZOS,
+                    )
+                tmp = NamedTemporaryFile(delete=False, suffix=".jpg")
+                tmp.close()
+                img.save(tmp.name, format="JPEG", quality=quality, optimize=True)
+                return tmp.name
+        except Exception as exc:
+            logger.warning("Image compress skipped for %s: %s", image_path, exc)
+            return image_path
+
     @staticmethod
     def _image_bytes_for_part(image_path: str, part) -> bytes:
-        """Return image bytes matching the template part's format (usually JPEG)."""
+        """Return compressed image bytes matching the template part's format."""
         from io import BytesIO
 
         raw = Path(image_path).read_bytes()
         partname = str(getattr(part, "partname", "") or "").lower()
-        wants_jpeg = partname.endswith((".jpg", ".jpeg")) or "image/jpeg" in str(
-            getattr(part, "content_type", "")
-        ).lower()
+        content_type = str(getattr(part, "content_type", "") or "").lower()
+        wants_jpeg = partname.endswith((".jpg", ".jpeg")) or "image/jpeg" in content_type
+        wants_png = partname.endswith(".png") or "image/png" in content_type
 
-        is_jpeg = raw[:3] == b"\xff\xd8\xff"
-        if wants_jpeg and not is_jpeg:
-            try:
-                from PIL import Image
+        try:
+            from PIL import Image
 
-                img = Image.open(BytesIO(raw)).convert("RGB")
-                buf = BytesIO()
-                img.save(buf, format="JPEG", quality=90)
-                return buf.getvalue()
-            except Exception as exc:
-                logger.warning("Could not convert %s to JPEG: %s", image_path, exc)
-        return raw
+            img = Image.open(BytesIO(raw)).convert("RGB")
+            w, h = img.size
+            max_edge = 1400
+            scale = min(1.0, float(max_edge) / float(max(w, h)))
+            if scale < 1.0:
+                img = img.resize(
+                    (max(1, int(w * scale)), max(1, int(h * scale))),
+                    Image.LANCZOS,
+                )
+            buf = BytesIO()
+            if wants_png and not wants_jpeg:
+                # Keep PNG part valid but still shrink pixels
+                img_rgba = img.convert("RGBA")
+                img_rgba.save(buf, format="PNG", optimize=True)
+            else:
+                img.save(buf, format="JPEG", quality=72, optimize=True)
+            return buf.getvalue()
+        except Exception as exc:
+            logger.warning("Could not compress %s for template part: %s", image_path, exc)
+            return raw
 
     def _replace_image_placeholder(self, doc: Document, placeholder: str, image_path: Optional[str], width_inches: float = 3.0):
         """
@@ -2847,6 +3354,13 @@ Rules:
         
         # Load template
         doc = Document(self.template_path)
+        is_prospect = self._is_prospect_run(doc)
+        if is_prospect:
+            logger.info(
+                "Using Prospect (5-7 page) short-form template layout (%s)",
+                self.template_path,
+            )
+            self._ensure_prospect_header_footer(doc)
 
         # Property-detail fields should always show a value so the report stays
         # consistent with the prior template (blank inputs -> "N/A").
@@ -2907,12 +3421,19 @@ Rules:
             '{{market_quarter}}': property_data.market_quarter,
         }
 
-        # Merge BOV table values (population, households, rings, employment, valuation)
+        # Cover polish BEFORE placeholder replacement so {{address}} is still findable.
+        # Theme tint on hero, left-flush bars, address in white diagonal corner.
+        self._polish_cover_layout(doc, color_theme=color_theme)
+
+        # Prefer a two-line cover address like the mock (street / city-state-zip)
         if property_data.table_values:
             replacements.update(property_data.table_values)
             ring_keys = [k for k in property_data.table_values if k.startswith("{{r")]
             logger.info("Merged %d BOV table placeholders (%d ring fields)",
                         len(property_data.table_values), len(ring_keys))
+        replacements["{{address}}"] = self._format_cover_address(
+            replacements.get("{{address}}") or property_data.address
+        )
         
         # Replace text in all document elements
         self._replace_text_in_document(doc, replacements)
@@ -2926,17 +3447,41 @@ Rules:
         # Justified paragraphs + soft breaks → huge word gaps on short last lines
         self._fix_justified_soft_breaks(doc)
 
-        # CLIENT look: regional body in italic blue, kept short
-        self._style_regional_analysis(doc)
+        # CLIENT look: regional body in italic blue (full template only)
+        if not is_prospect:
+            self._style_regional_analysis(doc)
 
         # Cover / aerial / subject images live in text boxes (alt-text placeholders).
-        # SUBJECT PHOTOS must be Street View only — never reuse the aerial map.
+        # Keep the template's designed diagonal cover hero (Picture 8) — only tint it.
+        # Bottom-left {{main_img}} is Street View only — never aerial.
+        cover_photo = property_data.street_view_image_path
+        aerial_photo = property_data.aerial_image_path
+        # Guard: never let a shared/mis-assigned path put the aerial onto the cover
+        if (
+            cover_photo
+            and aerial_photo
+            and Path(cover_photo).resolve() == Path(aerial_photo).resolve()
+        ):
+            logger.error(
+                "Street View path identical to aerial path (%s); blanking cover",
+                cover_photo,
+            )
+            cover_photo = None
+        if not cover_photo:
+            logger.warning(
+                "Street View unavailable for cover {{main_img}}; cover slot will be blanked "
+                "(will not fall back to aerial)"
+            )
+        else:
+            logger.info("Cover {{main_img}} <- Street View %s", cover_photo)
         self._replace_textbox_images(doc, {
-            '{{main_img}}': (property_data.aerial_image_path, 6.0),
-            '{{aerial_image}}': (property_data.aerial_image_path, 6.0),
+            '{{main_img}}': (cover_photo, 6.0),
+            '{{aerial_image}}': (aerial_photo, 6.0),
             '{{Subject_photo}}': (property_data.street_view_image_path, 3.5),
             '{{subject_photo}}': (property_data.street_view_image_path, 3.5),
         })
+        # Final pass: strip any remaining grey frames around image slots
+        self._strip_all_image_borders(doc)
 
         # Replace image placeholders in regular paragraphs/cells (legacy + BOV names)
         for ph in ('{{ariel_image}}', '{{aerial_map}}'):
@@ -2947,9 +3492,12 @@ Rules:
         # Insert comparable sales from uploaded PDF (fills the comps section; avoids blank page)
         if property_data.comps:
             self._insert_comparables(doc, property_data.comps)
+        else:
+            # Even without uploaded comps, keep reconciliation on its own page
+            self._ensure_page_break_before_heading(doc, "RECONCILIATION TABLE")
 
-        # Refresh employment table with recent-year data (not static 2010-2019 sample)
-        if property_data.bov_dataset:
+        # Refresh employment table with recent-year data (client template only)
+        if property_data.bov_dataset and not is_prospect:
             self._fill_employment_table(doc, property_data.bov_dataset, property_data.county, property_data.state)
 
         # Collapse leftover empty paragraphs that create large white gaps
@@ -2959,9 +3507,13 @@ Rules:
         # TOC is a full-page floating blue panel — without a page break before
         # EXECUTIVE SUMMARY, body text renders underneath it (page-2 bleed).
         self._ensure_page_break_before_heading(doc, "EXECUTIVE SUMMARY")
+        if is_prospect:
+            # Align TOC labels with body order so live page numbers increase
+            # sensibly (Demographics maps to Property Summary, etc.).
+            self._sync_prospect_toc_labels(doc)
 
         # Ensure TOC leaders are a single middle line (no title/page underlines)
-        self._normalize_toc_leaders(doc)
+        self._normalize_toc_leaders(doc, is_prospect=is_prospect)
 
         # Keep a blank line above section titles (e.g. after General Information table)
         for heading in self.SECTION_HEADINGS_NEEDING_SPACE:
@@ -2970,25 +3522,269 @@ Rules:
         # Remove the programmatic market analysis section since we're using placeholders
         # self._create_market_analysis_section(doc, property_data)
 
-        # Clean, client-friendly filename: BOV_<Property Name or Address>_<date>_<time>.docx
+        # Clean, client-friendly filename: BOV_[Prospect|Client]_<name>_<date>_<time>.docx
         label = (property_data.property_name or "").strip() or property_data.address
         safe_label = "".join(c for c in label if c.isalnum() or c in (" ", "-", "_")).strip()
         safe_label = "_".join(safe_label.split())[:60]
-        output_filename = f"BOV_{safe_label}_{datetime.now().strftime('%Y-%m-%d_%H%M')}.docx"
+        form_tag = "Prospect" if is_prospect else "Client"
+        output_filename = (
+            f"BOV_{form_tag}_{safe_label}_{datetime.now().strftime('%Y-%m-%d_%H%M')}.docx"
+        )
         output_path = self.output_dir / output_filename
         
         # Save document
         doc.save(output_path)
         logger.info(f"Document saved: {output_path}")
 
+        # TOC page numbers + cover shapes (white diagonal corner / Street View)
+        # via Word COM. Color theme runs after so COM cannot wipe accent colors.
+        self._refresh_toc_page_numbers(
+            output_path,
+            is_prospect=is_prospect,
+            street_view_path=cover_photo,
+        )
+
         # Apply color theme to the report accent (post-process the saved file)
         if color_theme:
             self._apply_color_theme(output_path, color_theme)
 
-        # TOC page numbers must match live pagination (not static template values)
-        self._refresh_toc_page_numbers(output_path)
-
         return str(output_path)
+
+    def _fix_cover_after_word_com(
+        self, output_path, street_view_path: Optional[str] = None
+    ) -> None:
+        """Repair cover after Word COM TOC refresh converts DrawingML → VML.
+
+        COM sets the white diagonal corner shapes to filled=\"f\" (invisible).
+        Restore solid white corner fills and white title text.
+
+        IMPORTANT: Do not inject VML imagedata/fill into Text Box 21 — that
+        produces packages Word refuses to open ("problems with the contents").
+        """
+        import zipfile
+        import shutil
+        import tempfile
+        import re
+
+        path = Path(output_path)
+        if not path.exists():
+            return
+
+        try:
+            with zipfile.ZipFile(path, "r") as zin:
+                files = {n: zin.read(n) for n in zin.namelist()}
+        except Exception as exc:
+            logger.error("Cover repair: cannot open %s: %s", path, exc)
+            return
+
+        xml_name = "word/document.xml"
+        rels_name = "word/_rels/document.xml.rels"
+        ct_name = "[Content_Types].xml"
+        if xml_name not in files:
+            return
+        xml = files[xml_name].decode("utf-8", "ignore")
+        original = xml
+        rels = files.get(rels_name, b"").decode("utf-8", "ignore")
+        package_changed = False
+
+        # --- 1) White diagonal corner (Parallelogram 3 + Rectangle 12) ---
+        def _fill_white(match: re.Match) -> str:
+            tag = match.group(0)
+            tag = re.sub(r'\sfilled="f"', ' filled="t"', tag)
+            if "filled=" not in tag:
+                tag = tag.replace(">", ' filled="t">', 1)
+            if "fillcolor=" in tag:
+                tag = re.sub(r'fillcolor="[^"]*"', 'fillcolor="#ffffff"', tag)
+            else:
+                tag = tag.replace(" filled=", ' fillcolor="#ffffff" filled=', 1)
+                if "fillcolor=" not in tag:
+                    tag = tag.replace(">", ' fillcolor="#ffffff">', 1)
+            tag = re.sub(r'\sstroked="t"', ' stroked="f"', tag)
+            return tag
+
+        for shape_id in ("Parallelogram 3", "Rectangle 12"):
+            pattern = rf'(<(?:v:)?(?:shape|rect)\b[^>]*\bid="{re.escape(shape_id)}"[^>]*/?>)'
+            xml2, n = re.subn(pattern, _fill_white, xml, count=1)
+            if n:
+                xml = xml2
+                logger.info("Cover repair: forced white fill on %s", shape_id)
+
+        xml = re.sub(
+            r'(<(?:v:)?group\b[^>]*\bid="Group 13"[^>]*)\sfilled="f"',
+            r'\1 filled="t" fillcolor="#ffffff"',
+            xml,
+            count=1,
+        )
+
+        # --- 2) White title text on "Broker Opinion of Value" ---
+        # Replace existing w:color (do NOT add a second w:color — Word rejects that)
+        def _whiten_title_rpr(m: re.Match) -> str:
+            rpr, rest = m.group(1), m.group(2)
+            if re.search(r'<w:color\b', rpr):
+                rpr = re.sub(
+                    r'<w:color\b[^>]*/>',
+                    '<w:color w:val="FFFFFF"/>',
+                    rpr,
+                    count=1,
+                )
+            else:
+                rpr = rpr + '<w:color w:val="FFFFFF"/>'
+            return rpr + rest
+
+        xml = re.sub(
+            r"(<w:rPr>(?:(?!</w:rPr>).)*?)(</w:rPr>\s*<w:t[^>]*>Broker Opinion of Value</w:t>)",
+            _whiten_title_rpr,
+            xml,
+            flags=re.DOTALL,
+        )
+
+        # --- 3) Strip unsafe VML image injects from older broken builds ---
+        xml2, n_strip = re.subn(
+            r'(id="Text Box 21"[^>]*>)\s*(?:<v:fill\b[^>]*/>\s*)?(?:<v:imagedata\b[^>]*/>\s*)?',
+            r"\1",
+            xml,
+            count=1,
+            flags=re.IGNORECASE,
+        )
+        if n_strip:
+            xml = xml2
+            logger.info("Cover repair: removed unsafe VML image inject from Text Box 21")
+
+        for orphan in (
+            "word/media/cover_street.jpg",
+            "word/media/cover_street.jpeg",
+        ):
+            if orphan in files:
+                files.pop(orphan, None)
+                package_changed = True
+                logger.info("Cover repair: removed orphan media %s", orphan)
+
+        if "cover_street" in rels:
+            rels2 = re.sub(
+                r'<Relationship[^>]*Target="media/cover_street\.(?:jpg|jpeg)"[^>]*/>',
+                "",
+                rels,
+            )
+            if rels2 != rels:
+                files[rels_name] = rels2.encode("utf-8")
+                package_changed = True
+                logger.info("Cover repair: removed cover_street relationship")
+
+        ct = files.get(ct_name, b"").decode("utf-8", "ignore")
+        if ct and "cover_street" in ct:
+            ct2 = re.sub(
+                r'<Override[^>]*cover_street\.(?:jpg|jpeg)"[^>]*/>', "", ct
+            )
+            if ct2 != ct:
+                files[ct_name] = ct2.encode("utf-8")
+                package_changed = True
+
+        if xml == original and not package_changed:
+            logger.info("Cover repair: no changes needed")
+            return
+
+        try:
+            from lxml import etree
+
+            etree.fromstring(xml.encode("utf-8"))
+            if rels_name in files:
+                etree.fromstring(files[rels_name])
+            if ct_name in files:
+                etree.fromstring(files[ct_name])
+        except Exception as exc:
+            logger.error(
+                "Cover repair aborted — generated XML would be invalid: %s", exc
+            )
+            return
+
+        files[xml_name] = xml.encode("utf-8")
+        tmp_fd, tmp_path = tempfile.mkstemp(suffix=".docx")
+        os.close(tmp_fd)
+        try:
+            with zipfile.ZipFile(tmp_path, "w", zipfile.ZIP_DEFLATED) as zout:
+                for name, data in files.items():
+                    zout.writestr(name, data)
+            shutil.move(tmp_path, path)
+            logger.info("Cover repair applied to %s", path)
+        except Exception as exc:
+            logger.error("Cover repair write failed: %s", exc)
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
+
+    def _is_prospect_run(self, doc: Optional[Document] = None) -> bool:
+        """True when generating the Prospect short-form (path first, then doc heuristic)."""
+        path = str(getattr(self, "template_path", "") or "").lower()
+        if "prospect" in path or path.endswith("short") or "short_form" in path:
+            return True
+        if doc is not None:
+            return self._is_prospect_template(doc)
+        return False
+
+    @staticmethod
+    def _is_prospect_template(doc: Document) -> bool:
+        """True for the condensed 5-7 page BOV (Prospect) short-form layout."""
+        if len(doc.tables) <= 6:
+            for table in doc.tables:
+                try:
+                    title = (table.rows[0].cells[0].text or "").strip().upper()
+                except Exception:
+                    continue
+                if title.startswith("POPULATION") and "DENSITY" not in title:
+                    return False
+                if title.startswith("EMPLOYMENT"):
+                    return False
+            return True
+        return False
+
+    @staticmethod
+    def _ensure_prospect_header_footer(doc: Document) -> None:
+        """Keep blue header/footer bars + Page X of Y on Prospect short-form.
+
+        Short-form originally linked these via a mid-doc sectPr in the comps zone.
+        If that paragraph is removed, bars/page numbers disappear. Re-link them
+        on the body sectPr (same visual as Client long template).
+        """
+        from lxml import etree
+        from docx.oxml.ns import qn
+
+        header_rid = footer_rid = None
+        for rel in doc.part.rels.values():
+            target = str(getattr(rel, "target_ref", "") or "").lower()
+            if "header" in target and header_rid is None:
+                header_rid = rel.rId
+            if "footer" in target and footer_rid is None:
+                footer_rid = rel.rId
+        if not header_rid or not footer_rid:
+            logger.warning("Prospect template missing header/footer parts")
+            return
+
+        sect = doc.element.body.find(qn("w:sectPr"))
+        if sect is None:
+            return
+
+        w_header = qn("w:headerReference")
+        w_footer = qn("w:footerReference")
+        existing_h = sect.findall(w_header)
+        existing_f = sect.findall(w_footer)
+        if existing_h and existing_f:
+            return
+
+        for tag in (w_header, w_footer):
+            for el in list(sect.findall(tag)):
+                sect.remove(el)
+        href = etree.Element(w_header)
+        href.set(qn("w:type"), "default")
+        href.set(qn("r:id"), header_rid)
+        fref = etree.Element(w_footer)
+        fref.set(qn("w:type"), "default")
+        fref.set(qn("r:id"), footer_rid)
+        sect.insert(0, fref)
+        sect.insert(0, href)
+        logger.info(
+            "Restored Prospect header/footer refs (%s / %s)", header_rid, footer_rid
+        )
 
     @staticmethod
     def _paragraph_has_page_break(paragraph) -> bool:
@@ -3032,7 +3828,9 @@ Rules:
                 paragraph._element.xpath(".//*[local-name()='drawing']")
             )
             has_page_break = self._paragraph_has_page_break(paragraph)
-            if has_page_break:
+            pPr = paragraph._element.find(qn("w:pPr"))
+            has_sectpr = pPr is not None and pPr.find(qn("w:sectPr")) is not None
+            if has_page_break or has_sectpr:
                 empty_streak = 0
                 continue
             if not text and not has_drawing:
@@ -3084,13 +3882,12 @@ Rules:
         target._element.addprevious(new_p)
         logger.info("Inserted blank paragraph before %s", heading)
 
-    def _normalize_toc_leaders(self, doc: Document) -> None:
+    def _normalize_toc_leaders(self, doc: Document, is_prospect: bool = False) -> None:
         """TOC rows: title | mid-height underscore line | page.
 
-        Underscore glyphs sit on the baseline by default. Raising the leader
-        run with w:position lifts the line into the vertical middle of the
-        title/page text. Page numbers are filled after save via
-        `_refresh_toc_page_numbers`.
+        Leaders are a fixed middle column so every row's line starts and ends on
+        the same vertical edges (Client look). Underscores use noWrap so they
+        never wrap into a second stray dash line.
         """
         from docx.enum.text import WD_ALIGN_PARAGRAPH
         from docx.enum.table import WD_CELL_VERTICAL_ALIGNMENT
@@ -3105,19 +3902,58 @@ Rules:
         if "executive" not in first:
             return
 
-        titles = [
-            "Executive Summary",
-            "Subject Photos",
-            "Demographics",
-            "Comparables",
-            "Certification",
-        ]
-        # CLIENT-style column widths (twips)
+        # Preserve labels already in the template (Prospect adds Properties for Sale)
+        titles = []
+        for row in table.rows:
+            label = (row.cells[0].text or "").strip().replace("\x07", "").replace("\r", "")
+            # Title cell may still hold an old tab-leader layout
+            if "\t" in label:
+                label = label.split("\t", 1)[0].strip()
+            # Strip any leftover underscores from prior leader merges
+            label = label.strip(" _")
+            if label:
+                titles.append(label)
+        if not titles:
+            titles = [
+                "Executive Summary",
+                "Subject Photos",
+                "Demographics",
+                "Comparables",
+                "Certification",
+            ]
+
+        # Exact Client TOC proportions so Prospect matches the long-template
+        # rhythm (generous row height + shared leader column edge).
         col_widths = ("2985", "6192", "1078")
-        leader = "_" * 54
+        if is_prospect:
+            # Slightly wider title for "Properties for Sale"; keep total ~10255
+            col_widths = ("3200", "5977", "1078")
         toc_font_pt = 11
-        # Half-points above baseline so underscore sits mid-glyph at 11pt
+        leader = "_" * 54
+        # Half-points above baseline so underscore sits mid-glyph (Client look)
         leader_raise = 9
+        row_height_twips = "1440"
+
+        # Match Client fixed table width so the floating blue TOC panel lays out
+        # the same way on both templates.
+        tblPr = table._tbl.find(qn("w:tblPr"))
+        if tblPr is not None:
+            tblW = tblPr.find(qn("w:tblW"))
+            if tblW is None:
+                tblW = OxmlElement("w:tblW")
+                tblPr.append(tblW)
+            tblW.set(qn("w:w"), "10255")
+            tblW.set(qn("w:type"), "dxa")
+
+        # Force tblGrid to match (Word prefers grid over tcW alone)
+        tblGrid = table._tbl.find(qn("w:tblGrid"))
+        if tblGrid is not None:
+            for gc in list(tblGrid.findall(qn("w:gridCol"))):
+                tblGrid.remove(gc)
+            for width in col_widths:
+                gc = OxmlElement("w:gridCol")
+                gc.set(qn("w:w"), width)
+                tblGrid.append(gc)
 
         def clear_pbdr(p):
             pPr = p._p.find(qn("w:pPr"))
@@ -3135,13 +3971,32 @@ Rules:
                 pPr.append(spacing)
             spacing.set(qn("w:before"), "0")
             spacing.set(qn("w:after"), "0")
-            spacing.set(qn("w:line"), "240")
+            # Match Client body line spacing inside the tall TOC rows
+            spacing.set(qn("w:line"), "276")
             spacing.set(qn("w:lineRule"), "auto")
+            # Zero cell-like indent so titles/leaders share a clean left edge
+            ind = pPr.find(qn("w:ind"))
+            if ind is not None:
+                pPr.remove(ind)
+
+        def set_cell_margins(cell, margin_twips: str = "0"):
+            tcPr = cell._tc.get_or_add_tcPr()
+            tcMar = tcPr.find(qn("w:tcMar"))
+            if tcMar is not None:
+                tcPr.remove(tcMar)
+            tcMar = OxmlElement("w:tcMar")
+            for side in ("top", "left", "bottom", "right"):
+                el = OxmlElement(f"w:{side}")
+                el.set(qn("w:w"), margin_twips)
+                el.set(qn("w:type"), "dxa")
+                tcMar.append(el)
+            tcPr.append(tcMar)
 
         def style_run(run, size_pt=toc_font_pt, raise_hp=0):
             run.font.size = Pt(size_pt)
             run.font.color.rgb = RGBColor(0xFF, 0xFF, 0xFF)
             run.font.underline = False
+            run.font.name = "Calibri"
             rPr = run._r.get_or_add_rPr()
             u = rPr.find(qn("w:u"))
             if u is not None:
@@ -3152,6 +4007,12 @@ Rules:
                 rPr.append(color)
             color.set(qn("w:val"), "FFFFFF")
             color.set(qn("w:themeColor"), "background1")
+            rFonts = rPr.find(qn("w:rFonts"))
+            if rFonts is None:
+                rFonts = OxmlElement("w:rFonts")
+                rPr.append(rFonts)
+            for attr in ("ascii", "hAnsi", "cs"):
+                rFonts.set(qn(f"w:{attr}"), "Calibri")
             half = str(int(size_pt * 2))
             for tag in ("sz", "szCs"):
                 el = rPr.find(qn(f"w:{tag}"))
@@ -3213,11 +4074,10 @@ Rules:
             if trH is None:
                 trH = OxmlElement("w:trHeight")
                 trPr.append(trH)
-            trH.set(qn("w:val"), "1440")
+            trH.set(qn("w:val"), row_height_twips)
             trH.set(qn("w:hRule"), "atLeast")
 
             rebuild_row_cells(row)
-            # Re-bind cells after XML rebuild
             cells = row.cells
 
             specs = (
@@ -3228,17 +4088,25 @@ Rules:
             for ci, text, align, raise_hp in specs:
                 cell = cells[ci]
                 cell.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.CENTER
+                set_cell_margins(cell, "60")
+                tcPr = cell._tc.get_or_add_tcPr()
+                # Never wrap title or leader (prevents stray second underscore line)
+                if ci in (0, 1):
+                    if tcPr.find(qn("w:noWrap")) is None:
+                        tcPr.append(OxmlElement("w:noWrap"))
                 p = cell.paragraphs[0]
                 clear_pbdr(p)
                 set_tight_spacing(p)
                 p.alignment = align
                 p.clear()
-                style_run(p.add_run(text), raise_hp=raise_hp)
+                clean = text.replace("\n", " ").replace("\r", " ").strip()
+                style_run(p.add_run(clean), raise_hp=raise_hp)
 
         logger.info(
-            "Normalized TOC leaders (%spt, mid-height raised underscores +%s hp)",
+            "Normalized TOC leaders (Client spacing: %spt, row=%s twips, cols=%s)",
             toc_font_pt,
-            leader_raise,
+            row_height_twips,
+            col_widths,
         )
 
     # TOC label -> body heading used to resolve the real page number
@@ -3250,13 +4118,78 @@ Rules:
         ("Certification", "CERTIFICATION AND DISCLAIMERS"),
     )
 
-    def _refresh_toc_page_numbers(self, output_path) -> None:
+    # Prospect short-form: TOC labels map to actual short-form headings.
+    # "Properties for Sale" is not included (no for-sale listings section).
+    PROSPECT_TOC_SECTION_HEADINGS = (
+        ("Executive Summary", "EXECUTIVE SUMMARY"),
+        ("Demographics", "PROPERTY SUMMARY"),
+        ("Subject Photos", "SUBJECT PHOTOS"),
+        ("Comparables", "PROPERTY COMPARABLES"),
+        ("Certification", "CERTIFICATION AND DISCLAIMERS"),
+    )
+
+    def _sync_prospect_toc_labels(self, doc: Document) -> None:
+        """Keep Prospect TOC labels in body order; drop Properties for Sale rows."""
+        if not doc.tables:
+            return
+        table = doc.tables[0]
+        first = (table.rows[0].cells[0].text or "").strip().lower() if table.rows else ""
+        if "executive" not in first:
+            return
+
+        labels = [label for label, _ in self.PROSPECT_TOC_SECTION_HEADINGS]
+
+        # Remove "Properties for Sale" (and similar) rows from the TOC table
+        for row in list(table.rows):
+            raw = (row.cells[0].text or "").strip().replace("\x07", "").replace("\r", "")
+            if "\t" in raw:
+                raw = raw.split("\t", 1)[0].strip()
+            key = raw.strip(" _").lower()
+            if "properties for sale" in key or key == "for sale":
+                parent = row._tr.getparent()
+                if parent is not None:
+                    parent.remove(row._tr)
+
+        # Trim any leftover extra rows beyond the Prospect TOC set
+        while len(table.rows) > len(labels):
+            parent = table.rows[-1]._tr.getparent()
+            if parent is None:
+                break
+            parent.remove(table.rows[-1]._tr)
+
+        for i, label in enumerate(labels):
+            if i >= len(table.rows):
+                break
+            cell = table.rows[i].cells[0]
+            current = (cell.text or "").strip().replace("\x07", "").replace("\r", "")
+            if "\t" in current:
+                current = current.split("\t", 1)[0].strip()
+            if current != label:
+                if cell.paragraphs and cell.paragraphs[0].runs:
+                    cell.paragraphs[0].runs[0].text = label
+                    for run in cell.paragraphs[0].runs[1:]:
+                        run.text = ""
+                else:
+                    cell.text = label
+
+        logger.info("Synced Prospect TOC labels (no Properties for Sale): %s", labels)
+
+    def _refresh_toc_page_numbers(
+        self,
+        output_path,
+        is_prospect: bool = False,
+        street_view_path: Optional[str] = None,
+    ) -> None:
         """Set TOC page numbers from where each section actually lands in the Word doc.
 
         Uses Word COM so pagination matches what the user sees after generation
         (comps, demographics, etc. can shift pages vs the static template).
+
+        Also restores cover visuals Word otherwise drops: white diagonal corner
+        (Group 13) and bottom-left Street View photo.
         """
         try:
+            import pythoncom  # type: ignore
             import win32com.client  # type: ignore
         except ImportError:
             logger.warning(
@@ -3267,6 +4200,7 @@ Rules:
         path = str(Path(output_path).resolve())
         word = None
         doc = None
+        pythoncom.CoInitialize()
         try:
             word = win32com.client.DispatchEx("Word.Application")
             word.Visible = False
@@ -3278,10 +4212,15 @@ Rules:
             total_pages = int(doc.ComputeStatistics(2))  # wdStatisticPages
             # Resolve each body heading page (skip TOC page hits by matching uppercase)
             resolved = {}
-            for toc_label, heading in self.TOC_SECTION_HEADINGS:
+            toc_map = (
+                self.PROSPECT_TOC_SECTION_HEADINGS
+                if is_prospect
+                else self.TOC_SECTION_HEADINGS
+            )
+            for toc_label, heading in toc_map:
                 # Start search after page 2 (cover/TOC) when possible
                 start_page = 3 if total_pages >= 3 else 1
-                word.Selection.GoTo(What=1, Which=1, Count=start_page)
+                word.Selection.GoTo(What=1, Which=1, Count=start_page)  # wdGoToPage
                 rng = doc.Range(word.Selection.Start, doc.Content.End)
                 find = rng.Find
                 find.ClearFormatting()
@@ -3289,74 +4228,121 @@ Rules:
                 find.MatchCase = True
                 find.Forward = True
                 find.Wrap = 0  # wdFindStop
-                if find.Execute():
-                    resolved[toc_label] = int(rng.Information(3))  # wdActiveEndPageNumber
-                else:
+                found = bool(find.Execute())
+                if not found:
                     # Fallback: case-insensitive anywhere after page 1
                     word.Selection.GoTo(What=1, Which=1, Count=2)
                     rng = doc.Range(word.Selection.Start, doc.Content.End)
                     find = rng.Find
+                    find.ClearFormatting()
                     find.Text = heading
                     find.MatchCase = False
                     find.Forward = True
                     find.Wrap = 0
-                    if find.Execute():
-                        resolved[toc_label] = int(rng.Information(3))
+                    found = bool(find.Execute())
+                if found:
+                    resolved[toc_label] = int(rng.Information(3))  # wdActiveEndPageNumber
+                else:
+                    logger.warning("TOC heading not found for page resolve: %s", heading)
 
             if not resolved:
                 logger.warning("Could not resolve any TOC section pages")
-                return
 
             # Update first table that looks like the TOC
             toc_table = None
-            for i in range(1, doc.Tables.Count + 1):
-                tbl = doc.Tables(i)
-                try:
-                    if "executive" in (tbl.Cell(1, 1).Range.Text or "").lower():
-                        toc_table = tbl
-                        break
-                except Exception:
-                    continue
-            if toc_table is None:
+            updated = 0
+            if resolved:
+                for i in range(1, doc.Tables.Count + 1):
+                    tbl = doc.Tables(i)
+                    try:
+                        if "executive" in (tbl.Cell(1, 1).Range.Text or "").lower():
+                            toc_table = tbl
+                            break
+                    except Exception:
+                        continue
+            if resolved and toc_table is None:
                 logger.warning("TOC table not found for page-number refresh")
-                return
 
-            for row_idx in range(1, toc_table.Rows.Count + 1):
-                try:
-                    cell = toc_table.Cell(row_idx, 1)
-                    raw = (cell.Range.Text or "").replace("\r", "").replace("\x07", "")
-                    if "\t" in raw:
-                        label = raw.split("\t", 1)[0].strip()
-                    else:
-                        label = raw.strip()
-                    page_num = resolved.get(label)
-                    if page_num is None:
+            # Drop Properties for Sale rows in Word before writing page numbers
+            if toc_table is not None and is_prospect:
+                for row_idx in range(toc_table.Rows.Count, 0, -1):
+                    try:
+                        raw = (
+                            (toc_table.Cell(row_idx, 1).Range.Text or "")
+                            .replace("\r", "")
+                            .replace("\x07", "")
+                        )
+                        label = raw.split("\t", 1)[0].strip().lower()
+                        if "properties for sale" in label or label == "for sale":
+                            toc_table.Rows(row_idx).Delete()
+                    except Exception:
                         continue
 
-                    para = cell.Range.Paragraphs(1)
-                    para_text = (para.Range.Text or "").replace("\r", "").replace("\x07", "")
-                    tab_idx = para_text.find("\t")
-                    if tab_idx >= 0:
-                        page_start = para.Range.Start + tab_idx + 1
-                        page_end = para.Range.End - 1
-                        page_rng = doc.Range(page_start, page_end)
-                        page_rng.Text = str(page_num)
-                        page_rng.Font.Color = 16777215  # white
-                        page_rng.Font.Size = 11
-                    else:
-                        # Legacy 3-column TOC
-                        page_cell = toc_table.Cell(row_idx, 3)
-                        rng = page_cell.Range
-                        rng.MoveEnd(Unit=1, Count=-1)
-                        rng.Text = str(page_num)
-                        rng.Font.Color = 16777215
-                        rng.Font.Size = 11
-                        page_cell.Range.ParagraphFormat.Alignment = 2
-                except Exception as cell_exc:
-                    logger.warning("TOC row %s update failed: %s", row_idx, cell_exc)
+            if toc_table is not None:
+                # Build case-insensitive lookup for TOC labels
+                resolved_ci = {k.strip().lower(): v for k, v in resolved.items()}
+
+                for row_idx in range(1, toc_table.Rows.Count + 1):
+                    try:
+                        cell = toc_table.Cell(row_idx, 1)
+                        raw = (cell.Range.Text or "").replace("\r", "").replace("\x07", "")
+                        if "\t" in raw:
+                            label = raw.split("\t", 1)[0].strip()
+                        else:
+                            label = raw.strip()
+                        page_num = resolved.get(label)
+                        if page_num is None:
+                            page_num = resolved_ci.get(label.lower())
+                        if page_num is None:
+                            # Prefix match (e.g. "Executive Summary\rSomething")
+                            for key, val in resolved_ci.items():
+                                if label.lower().startswith(key) or key.startswith(label.lower()):
+                                    page_num = val
+                                    break
+                        if page_num is None:
+                            logger.warning("No resolved page for TOC label %r", label)
+                            continue
+
+                        para = cell.Range.Paragraphs(1)
+                        para_text = (para.Range.Text or "").replace("\r", "").replace("\x07", "")
+                        tab_idx = para_text.find("\t")
+                        if tab_idx >= 0:
+                            page_start = para.Range.Start + tab_idx + 1
+                            page_end = para.Range.End - 1
+                            page_rng = doc.Range(page_start, page_end)
+                            page_rng.Text = str(page_num)
+                            page_rng.Font.Color = 16777215  # white
+                            page_rng.Font.Size = 11
+                        else:
+                            # Legacy 3-column TOC
+                            page_cell = toc_table.Cell(row_idx, 3)
+                            rng = page_cell.Range
+                            rng.MoveEnd(Unit=1, Count=-1)
+                            rng.Text = str(page_num)
+                            rng.Font.Color = 16777215
+                            rng.Font.Size = 11
+                            page_cell.Range.ParagraphFormat.Alignment = 2  # wdAlignParagraphRight
+                        updated += 1
+                    except Exception as cell_exc:
+                        logger.warning("TOC row %s update failed: %s", row_idx, cell_exc)
+
+                doc.Repaginate()
+                logger.info(
+                    "Refreshed TOC page numbers from live pagination (%s/%s rows): %s (doc pages=%s)",
+                    updated,
+                    toc_table.Rows.Count,
+                    resolved,
+                    total_pages,
+                )
+
+            # Cover: white diagonal corner + Street View (same Word session —
+            # hand-edited VML imagedata corrupts the package).
+            try:
+                self._word_fix_cover_shapes(doc, street_view_path)
+            except Exception as cover_exc:
+                logger.warning("Cover shape fix via Word COM failed: %s", cover_exc)
 
             doc.Save()
-            logger.info("Refreshed TOC page numbers from live pagination: %s", resolved)
         except Exception as exc:
             logger.warning("TOC page-number refresh failed: %s", exc)
         finally:
@@ -3370,6 +4356,234 @@ Rules:
                     word.Quit()
             except Exception:
                 pass
+            try:
+                pythoncom.CoUninitialize()
+            except Exception:
+                pass
+
+    def _word_fix_cover_shapes(self, doc, street_view_path: Optional[str] = None) -> None:
+        """Restore cover corner + property photo using Word's shape API (safe OOXML).
+
+        Group 13 children ship with Fill.Visible=False after open; Text Box 21
+        loses its picture. Avoid ZOrder/Delete (crash Word 2007) — AddPicture
+        places the Street View on top of the white corner shapes.
+        """
+        sv = None
+        if street_view_path and Path(street_view_path).exists():
+            sv = str(Path(street_view_path).resolve())
+
+        group = None
+        tb21 = None
+        addr = None
+        hero = None
+        for i in range(1, int(doc.Shapes.Count) + 1):
+            shape = doc.Shapes(i)
+            name = shape.Name or ""
+            if name == "Group 13":
+                group = shape
+            elif name == "Text Box 21":
+                tb21 = shape
+            elif name == "Picture 8":
+                hero = shape
+            elif name == "Text Box 26":
+                try:
+                    if not shape.TextFrame.HasText:
+                        continue
+                    text = (shape.TextFrame.TextRange.Text or "").strip()
+                    if "PREPARED" in text.upper():
+                        continue
+                    if text and len(text) < 100 and any(ch.isdigit() for ch in text):
+                        addr = shape
+                except Exception:
+                    pass
+
+        # Fallback: any short street-like textbox that isn't prepared-by/for
+        if addr is None:
+            for i in range(1, int(doc.Shapes.Count) + 1):
+                shape = doc.Shapes(i)
+                try:
+                    if not shape.TextFrame.HasText:
+                        continue
+                    text = (shape.TextFrame.TextRange.Text or "").strip()
+                except Exception:
+                    continue
+                if "PREPARED" in text.upper():
+                    continue
+                if (
+                    text
+                    and len(text) < 100
+                    and any(ch.isdigit() for ch in text)
+                    and "," in text
+                    and (shape.Name or "").startswith("Text Box")
+                ):
+                    addr = shape
+                    break
+
+        if group is not None:
+            try:
+                for j in range(1, int(group.GroupItems.Count) + 1):
+                    item = group.GroupItems(j)
+                    item.Fill.Visible = -1  # msoTrue
+                    item.Fill.Solid()
+                    item.Fill.ForeColor.RGB = 16777215  # white
+                logger.info(
+                    "Cover fix: whitened Group 13 corner shapes (%s items)",
+                    group.GroupItems.Count,
+                )
+            except Exception as exc:
+                logger.warning("Cover fix: could not whiten Group 13: %s", exc)
+
+        # Desired cover (mock): address nestled in the WHITE DIAGONAL CORNER
+        # (left wedge under the slant), photo in the lower-left slot — separate.
+        # Do NOT stack photo tightly under address (that reads as one mixed block).
+        hero_bottom = 438.0
+        if hero is not None:
+            try:
+                hero_bottom = float(hero.Top) + float(hero.Height)
+            except Exception:
+                pass
+
+        # Template slot for cover photo (Text Box 21) — capture before parking it
+        photo_left = -37.0
+        photo_top = 522.0
+        photo_width = 284.0
+        photo_height = 233.0  # designed slot height (do not shrink to a short strip)
+        if tb21 is not None:
+            try:
+                photo_left = float(tb21.Left)
+                photo_top = float(tb21.Top)
+                photo_width = float(tb21.Width)
+                photo_height = float(tb21.Height)
+            except Exception:
+                pass
+
+        # Address in diagonal white corner: flush left, tall enough for 2 full lines.
+        addr_top = min(365.0, hero_bottom - 70.0)
+        addr_left = min(-10.0, photo_left + 10.0)  # more left, near photo column
+        if addr is not None:
+            try:
+                raw = (addr.TextFrame.TextRange.Text or "").replace("\r", "").strip()
+                # Collapse soft breaks then re-split to street / city lines
+                raw = raw.replace("\v", " ").replace("\n", " ")
+                while "  " in raw:
+                    raw = raw.replace("  ", " ")
+                parts = [p.strip() for p in raw.split(",") if p.strip()]
+                if len(parts) >= 3:
+                    addr.TextFrame.TextRange.Text = (
+                        f"{parts[0]},\r{', '.join(parts[1:])}"
+                    )
+                elif len(parts) == 2:
+                    addr.TextFrame.TextRange.Text = f"{parts[0]},\r{parts[1]}"
+                try:
+                    addr.Line.Visible = 0
+                except Exception:
+                    pass
+                try:
+                    addr.Fill.Visible = 0
+                except Exception:
+                    pass
+                # Tight margins so both lines fit and text sits flush left
+                try:
+                    tf = addr.TextFrame
+                    tf.MarginLeft = 2.0
+                    tf.MarginRight = 2.0
+                    tf.MarginTop = 1.0
+                    tf.MarginBottom = 1.0
+                    tf.WordWrap = True
+                except Exception:
+                    pass
+                addr.Left = addr_left
+                addr.Top = addr_top
+                try:
+                    addr.Width = 300.0
+                    # ~2 lines @ ~14–16pt + margins — 48pt was clipping line 2
+                    addr.Height = 72.0
+                except Exception:
+                    pass
+                logger.info(
+                    "Cover fix: address L=%.1f T=%.1f H=%.1f (hero_bot=%.1f)",
+                    float(addr.Left),
+                    float(addr.Top),
+                    float(addr.Height),
+                    hero_bottom,
+                )
+            except Exception as exc:
+                logger.warning("Cover fix: address move failed: %s", exc)
+
+        if sv and tb21 is not None:
+            # Designed lower-left photo slot — keep near-template height
+            left = photo_left if photo_left > -200 else -37.0
+            top = photo_top
+            width = photo_width
+            height = photo_height if photo_height >= 200 else 233.0
+            max_bottom = 705.0
+            addr_bot = None
+            if addr is not None:
+                try:
+                    addr_bot = float(addr.Top) + float(addr.Height)
+                    if top < addr_bot + 24.0:
+                        top = addr_bot + 24.0
+                except Exception:
+                    addr_bot = None
+            if top + height > max_bottom:
+                overflow = (top + height) - max_bottom
+                min_top = (addr_bot + 24.0) if addr_bot is not None else (top - overflow)
+                top = max(top - overflow, min_top)
+                if top + height > max_bottom:
+                    height = max(200.0, max_bottom - top)
+
+            # Hide empty template frame (border made address+photo look one box)
+            try:
+                tb21.Line.Visible = 0
+                tb21.Fill.Visible = 0
+            except Exception:
+                pass
+            try:
+                # wdRelativeHorizontalPositionPage = 1
+                tb21.RelativeHorizontalPosition = 1
+                tb21.Left = -2500.0
+                tb21.Width = 1.0
+                tb21.Height = 1.0
+            except Exception:
+                try:
+                    tb21.Left = -2500.0
+                except Exception:
+                    pass
+
+            pic = doc.Shapes.AddPicture(
+                FileName=sv,
+                LinkToFile=False,
+                SaveWithDocument=True,
+                Left=left,
+                Top=top,
+                Width=width,
+                Height=height,
+            )
+            try:
+                pic.Name = "CoverStreetView"
+            except Exception:
+                pass
+            try:
+                pic.Line.Visible = 0
+            except Exception:
+                pass
+            gap = None
+            if addr is not None:
+                try:
+                    gap = float(top) - (float(addr.Top) + float(addr.Height))
+                except Exception:
+                    pass
+            logger.info(
+                "Cover fix: photo slot (%.1f, %.1f) h=%.1f gap_from_addr=%s",
+                left,
+                top,
+                height,
+                f"{gap:.1f}" if gap is not None else "n/a",
+            )
+        elif not sv:
+            logger.warning("Cover fix: no Street View path — cover photo not added")
+        else:
+            logger.warning("Cover fix: Text Box 21 not found — cover photo not added")
 
     def _ensure_page_break_before_heading(self, doc: Document, heading: str) -> None:
         """Insert a page break immediately before `heading` if one is missing.
@@ -3426,29 +4640,428 @@ Rules:
     COLOR_THEMES = {
         "light blue": ("0070C0", "00B0F0"),
         "dark blue": ("1F3864", "2E5496"),
-        "red": ("C00000", "FF3B3B"),
+        "red": ("C00000", "E31C23"),
         "green": ("2E7D32", "5BB85C"),
     }
+    # UI / legacy aliases
+    COLOR_THEME_ALIASES = {
+        "blue": "light blue",
+        "lightblue": "light blue",
+        "darkblue": "dark blue",
+    }
     TEMPLATE_ACCENTS = ("0070C0", "00B0F0")
+    TEMPLATE_HEADER_FOOTER_ACCENT = "0066CC"
+
+    def _normalize_color_theme(self, color_theme: Optional[str]) -> str:
+        """Map UI values like light-blue / darkblue -> canonical theme keys."""
+        theme = (color_theme or "").strip().lower().replace("-", " ").replace("_", " ")
+        theme = " ".join(theme.split())
+        return self.COLOR_THEME_ALIASES.get(theme, theme)
+
+    @staticmethod
+    def _format_cover_address(address: Optional[str]) -> str:
+        """Format cover address on two lines like the mock (street then city/state)."""
+        text = (address or "").strip()
+        if not text:
+            return ""
+        # Prefer split before city/state when ", ST ZIP" or ", City, ST" pattern exists
+        # e.g. "5700 Granite Pkwy, Frisco, TX 75034" -> street / "Frisco, TX 75034"
+        parts = [p.strip() for p in text.split(",") if p.strip()]
+        if len(parts) >= 3:
+            return f"{parts[0]},\n{', '.join(parts[1:])}"
+        if len(parts) == 2:
+            return f"{parts[0]},\n{parts[1]}"
+        # No commas — try last token that looks like a state abbrev
+        tokens = text.split()
+        if len(tokens) >= 3 and len(tokens[-2]) == 2 and tokens[-2].isalpha():
+            # "... Frisco TX 75034"
+            return f"{' '.join(tokens[:-3])} {tokens[-3]},\n{tokens[-2]} {tokens[-1]}"
+        return text
+
+    def _polish_cover_layout(self, doc: Document, color_theme: Optional[str] = None) -> None:
+        """Match the designed cover: tinted hero, left-flush bars, address in corner.
+
+        - Keep Picture 8 (diagonal hero) but apply a theme color shade/tint
+        - Title + date bars flush to the left (one-sided round on the right)
+        - White title text; address nestled in the bottom-left white diagonal corner
+        """
+        from lxml import etree
+        from docx.oxml.ns import qn
+
+        a_av = "{http://schemas.openxmlformats.org/drawingml/2006/main}avLst"
+        a_gd = "{http://schemas.openxmlformats.org/drawingml/2006/main}gd"
+        w_rpr = qn("w:rPr")
+        w_color = qn("w:color")
+
+        theme = self._normalize_color_theme(color_theme)
+        target = self.COLOR_THEMES.get(theme) or self.COLOR_THEMES["light blue"]
+        primary, secondary = target
+
+        title_shaped = date_shaped = title_whitened = addr_placed = 0
+
+        for drawing in doc.element.body.iter(qn("w:drawing")):
+            docPr = next(drawing.iter(qn("wp:docPr")), None)
+            if docPr is None:
+                continue
+            name = (docPr.get("name") or "").strip()
+            texts = " ".join(
+                (t.text or "") for t in drawing.iter(qn("w:t")) if t.text
+            ).strip()
+
+            # Skip off-canvas leftovers (ox far negative, no left-align)
+            posH = next(drawing.iter(qn("wp:positionH")), None)
+            ox_el = posH.find(qn("wp:posOffset")) if posH is not None else None
+            align_el = posH.find(qn("wp:align")) if posH is not None else None
+            ox = int(ox_el.text) if ox_el is not None and ox_el.text else None
+            is_left_aligned = align_el is not None and (align_el.text or "") == "left"
+            if ox is not None and ox < -5_000_000 and not is_left_aligned:
+                continue
+
+            # Title bar: flush left, one-sided round on the right (like the mock)
+            if "Broker Opinion of Value" in texts and name.startswith("Rectangle"):
+                self._cover_force_left_align(drawing)
+                for geom in drawing.iter(qn("a:prstGeom")):
+                    geom.set("prst", "round1Rect")
+                    av = geom.find(a_av)
+                    if av is None:
+                        av = etree.SubElement(geom, a_av)
+                    else:
+                        av.clear()
+                    gd = etree.SubElement(av, a_gd)
+                    gd.set("name", "adj")
+                    gd.set("fmla", "val 50000")
+                    title_shaped += 1
+                for run in drawing.iter(qn("w:r")):
+                    rPr = run.find(w_rpr)
+                    if rPr is None:
+                        rPr = etree.Element(w_rpr)
+                        run.insert(0, rPr)
+                    color = rPr.find(w_color)
+                    if color is None:
+                        color = etree.SubElement(rPr, w_color)
+                    color.set(qn("w:val"), "FFFFFF")
+                    title_whitened += 1
+                continue
+
+            # Date / property-name pill — flush left under the title
+            if name.startswith("Text Box") and texts.startswith("Date:"):
+                self._cover_force_left_align(drawing)
+                for geom in drawing.iter(qn("a:prstGeom")):
+                    geom.set("prst", "round1Rect")
+                    av = geom.find(a_av)
+                    if av is None:
+                        av = etree.SubElement(geom, a_av)
+                    else:
+                        av.clear()
+                    gd = etree.SubElement(av, a_gd)
+                    gd.set("name", "adj")
+                    gd.set("fmla", "val 35000")
+                    date_shaped += 1
+                    break
+                continue
+
+            # Address in the bottom-left white diagonal corner
+            if "{{address}}" in texts and "PREPARED" not in texts.upper():
+                self._cover_place_address_in_corner(drawing)
+                addr_placed += 1
+                continue
+
+            # Cover Street View slot must sit above the white corner group
+            if name == "Text Box 21" or "{{main_img}}" in (
+                (docPr.get("descr") or "")
+            ):
+                anchor = next(
+                    (a for a in drawing if etree.QName(a).localname == "anchor"),
+                    None,
+                )
+                if anchor is not None:
+                    anchor.set("behindDoc", "0")
+                    anchor.set("relativeHeight", "251670000")
+                continue
+
+        corner_ok = self._ensure_cover_diagonal_corner(doc)
+        tinted = self._tint_cover_hero(doc, primary, secondary)
+        logger.info(
+            "Cover polish: title_round=%s date_round=%s title_white=%s "
+            "address_corner=%s white_corner=%s hero_tint=%s theme=%s",
+            title_shaped,
+            date_shaped,
+            title_whitened,
+            addr_placed,
+            corner_ok,
+            tinted,
+            theme or "light blue",
+        )
+
+    @staticmethod
+    def _cover_force_left_align(drawing) -> None:
+        """Pin a cover shape to the left page edge (matches mock left corner stack)."""
+        from lxml import etree
+        from docx.oxml.ns import qn
+
+        posH = next(drawing.iter(qn("wp:positionH")), None)
+        if posH is None:
+            return
+        # Clear offset-based placement; use align=left
+        for child in list(posH):
+            if etree.QName(child).localname in ("posOffset", "align"):
+                posH.remove(child)
+        align = etree.SubElement(posH, qn("wp:align"))
+        align.text = "left"
+        if posH.get("relativeFrom") is None:
+            posH.set("relativeFrom", "page")
+
+    def _cover_place_address_in_corner(self, drawing) -> None:
+        """Sit address in the white diagonal corner (bottom-left), flush left."""
+        from lxml import etree
+        from docx.oxml.ns import qn
+
+        # Address flush-left in white diagonal corner (~365pt)
+        left_emu = str(int(-10 / 72 * 914400))  # ~-0.14" — more left
+        top_emu = str(int(365 / 72 * 914400))
+
+        posH = next(drawing.iter(qn("wp:positionH")), None)
+        posV = next(drawing.iter(qn("wp:positionV")), None)
+        if posH is not None:
+            for child in list(posH):
+                if etree.QName(child).localname in ("posOffset", "align"):
+                    posH.remove(child)
+            posH.set("relativeFrom", "page")
+            off = etree.SubElement(posH, qn("wp:posOffset"))
+            off.text = left_emu
+        if posV is not None:
+            for child in list(posV):
+                if etree.QName(child).localname in ("posOffset", "align"):
+                    posV.remove(child)
+            posV.set("relativeFrom", "page")
+            off = etree.SubElement(posV, qn("wp:posOffset"))
+            off.text = top_emu
+
+        # Keep address textbox above the white corner shape
+        anchor = next(
+            (a for a in drawing if etree.QName(a).localname == "anchor"),
+            None,
+        )
+        if anchor is not None:
+            anchor.set("behindDoc", "0")
+            anchor.set("relativeHeight", "251660000")
+
+    def _ensure_cover_diagonal_corner(self, doc: Document) -> bool:
+        """Force the bottom-left white diagonal corner (Group 13) to be visible.
+
+        Template children use grpFill/scheme bg1 which often fails to paint a
+        solid white wedge over the hero photo. Replace with explicit FFFFFF and
+        keep the group in front of Picture 8.
+        """
+        from lxml import etree
+        from docx.oxml.ns import qn
+
+        A = "{http://schemas.openxmlformats.org/drawingml/2006/main}"
+        WPS = "{http://schemas.microsoft.com/office/word/2010/wordprocessingShape}"
+        WPG = "{http://schemas.microsoft.com/office/word/2010/wordprocessingGroup}"
+        fixed = False
+
+        def _solid_white():
+            solid = etree.Element(A + "solidFill")
+            srgb = etree.SubElement(solid, A + "srgbClr")
+            srgb.set("val", "FFFFFF")
+            return solid
+
+        def _paint_spPr(spPr) -> bool:
+            changed = False
+            for child in list(spPr):
+                if etree.QName(child).localname in (
+                    "grpFill",
+                    "solidFill",
+                    "noFill",
+                    "gradFill",
+                ):
+                    spPr.remove(child)
+                    changed = True
+            geom = spPr.find(A + "prstGeom")
+            solid = _solid_white()
+            if geom is not None:
+                geom.addnext(solid)
+            else:
+                spPr.append(solid)
+            return True
+
+        for drawing in doc.element.body.iter(qn("w:drawing")):
+            docPr = next(drawing.iter(qn("wp:docPr")), None)
+            if docPr is None or (docPr.get("name") or "") != "Group 13":
+                continue
+            posH = next(drawing.iter(qn("wp:positionH")), None)
+            ox_el = posH.find(qn("wp:posOffset")) if posH is not None else None
+            ox = int(ox_el.text) if ox_el is not None and ox_el.text else 0
+            if ox < -5_000_000:
+                continue
+
+            anchor = next(
+                (a for a in drawing if etree.QName(a).localname == "anchor"),
+                None,
+            )
+            if anchor is not None:
+                # In front of hero photo (Picture 8 is behindDoc=1 / lower z)
+                anchor.set("behindDoc", "0")
+                anchor.set("relativeHeight", "251659000")
+
+            # Group fill -> solid white (wpg:grpSpPr or a:grpSpPr)
+            for grpSpPr in list(drawing.iter(WPG + "grpSpPr")) + list(
+                drawing.iter(A + "grpSpPr")
+            ):
+                for child in list(grpSpPr):
+                    local = etree.QName(child).localname
+                    if local in ("solidFill", "noFill", "gradFill", "grpFill"):
+                        grpSpPr.remove(child)
+                xfrm = grpSpPr.find(A + "xfrm")
+                solid = _solid_white()
+                if xfrm is not None:
+                    xfrm.addnext(solid)
+                else:
+                    grpSpPr.insert(0, solid)
+
+            # Child shapes: wps:spPr / a:spPr
+            for spPr in list(drawing.iter(WPS + "spPr")) + list(drawing.iter(A + "spPr")):
+                if _paint_spPr(spPr):
+                    fixed = True
+
+            # Neutralize accent1 style fillRef on wps:style / a:style
+            for style in list(drawing.iter(WPS + "style")) + list(drawing.iter(A + "style")):
+                fill_ref = style.find(A + "fillRef")
+                if fill_ref is None:
+                    continue
+                for child in list(fill_ref):
+                    fill_ref.remove(child)
+                srgb = etree.SubElement(fill_ref, A + "srgbClr")
+                srgb.set("val", "FFFFFF")
+                fixed = True
+
+            fixed = True
+            logger.info("Ensured white diagonal cover corner (Group 13)")
+            break
+
+        return fixed
+
+    def _tint_cover_hero(self, doc: Document, primary_hex: str, secondary_hex: str) -> bool:
+        """Apply a monochrome theme shade to the large cover Picture 8 hero."""
+        from io import BytesIO
+        from docx.oxml.ns import qn
+
+        try:
+            from PIL import Image, ImageOps
+        except ImportError:
+            logger.warning("Pillow missing — cannot tint cover hero")
+            return False
+
+        def _rgb(h: str):
+            h = (h or "0070C0").strip().lstrip("#")
+            return tuple(int(h[i : i + 2], 16) for i in (0, 2, 4))
+
+        primary = _rgb(primary_hex)
+        secondary = _rgb(secondary_hex)
+        # Dark end of duotone (shadows) + light end (highlights) for a wash look
+        dark = tuple(max(0, c // 5) for c in primary)
+        light = tuple(min(255, int(c + (255 - c) * 0.55)) for c in secondary)
+
+        tinted = False
+        for drawing in doc.element.body.iter(qn("w:drawing")):
+            docPr = next(drawing.iter(qn("wp:docPr")), None)
+            if docPr is None or (docPr.get("name") or "") != "Picture 8":
+                continue
+            ext = next(drawing.iter(qn("wp:extent")), None)
+            cx = int(ext.get("cx") or 0) if ext is not None else 0
+            if cx < 6_000_000:
+                continue  # ignore leftover tiny copies
+            blip = next(drawing.iter(qn("a:blip")), None)
+            if blip is None:
+                continue
+            rid = blip.get(qn("r:embed"))
+            part = doc.part.related_parts.get(rid) if rid else None
+            if part is None or not getattr(part, "_blob", None):
+                continue
+            try:
+                img = Image.open(BytesIO(part._blob)).convert("RGB")
+                gray = ImageOps.grayscale(img)
+                colored = ImageOps.colorize(gray, black=dark, white=light)
+                buf = BytesIO()
+                # Keep JPEG for typical cover parts
+                partname = str(getattr(part, "partname", "") or "").lower()
+                ctype = str(getattr(part, "content_type", "") or "").lower()
+                if partname.endswith(".png") or "image/png" in ctype:
+                    colored.convert("RGBA").save(buf, format="PNG", optimize=True)
+                else:
+                    colored.save(buf, format="JPEG", quality=85, optimize=True)
+                part._blob = buf.getvalue()
+                tinted = True
+                logger.info(
+                    "Tinted cover hero Picture 8 with theme shade %s→%s (%s bytes)",
+                    primary_hex,
+                    secondary_hex,
+                    len(part._blob),
+                )
+            except Exception as exc:
+                logger.error("Cover hero tint failed: %s", exc)
+        return tinted
 
     def _apply_color_theme(self, output_path, color_theme: str):
-        """Recolor the report accent by swapping the template's blue hex codes."""
-        theme = (color_theme or "").strip().lower()
+        """Recolor report accents, including header/footer bars.
+
+        Applies the same way for red, green, dark blue, and light blue:
+        - cover title bar + body accents: 0070C0 / 00B0F0 -> theme primary/secondary
+        - header/footer bars: 0066CC (and VML #06c) -> theme primary
+
+        Handles DrawingML (`srgbClr val="0066CC"`), Word hex attrs, and VML
+        `fillcolor="#06c"` (short CSS form of #0066CC after Word COM save).
+        """
+        theme = self._normalize_color_theme(color_theme)
         target = self.COLOR_THEMES.get(theme)
-        if not target or theme == "light blue":
-            return  # default/unknown -> leave template's blue
+        if not target:
+            logger.info("Unknown color theme %r — leaving template blues", color_theme)
+            return
 
         import zipfile
         import shutil
         import tempfile
 
         src_primary, src_secondary = self.TEMPLATE_ACCENTS
+        src_header_footer = self.TEMPLATE_HEADER_FOOTER_ACCENT
         dst_primary, dst_secondary = target
 
+        def _variants(hex6: str):
+            """All common Word XML spellings of a 6-digit hex color."""
+            h = hex6.upper()
+            lo = h.lower()
+            short = None
+            if len(h) == 6 and h[0] == h[1] and h[2] == h[3] and h[4] == h[5]:
+                short = f"{h[0]}{h[2]}{h[4]}"  # e.g. 0066CC -> 06C
+            out = [
+                f'"{h}"',
+                f'"{lo}"',
+                f"#{h}",
+                f"#{lo}",
+            ]
+            if short:
+                out.extend([f"#{short}", f"#{short.lower()}"])
+            return out
+
         def recolor(text: str) -> str:
-            for src, dst in ((src_primary, dst_primary), (src_secondary, dst_secondary)):
-                text = text.replace(f'"{src}"', f'"{dst}"')
-                text = text.replace(f'"{src.lower()}"', f'"{dst}"')
+            # Header/footer first so 0066CC never accidentally matches a later pass.
+            pairs = (
+                (src_header_footer, dst_primary),
+                (src_primary, dst_primary),
+                (src_secondary, dst_secondary),
+            )
+            for src, dst in pairs:
+                if src.upper() == dst.upper():
+                    continue  # light blue body accents already match template
+                for form in _variants(src):
+                    if form.startswith("#"):
+                        text = text.replace(form, f"#{dst}")
+                        alt = form.upper() if form == form.lower() else form.lower()
+                        if alt != form:
+                            text = text.replace(alt, f"#{dst}")
+                    else:
+                        text = text.replace(form, f'"{dst}"')
             return text
 
         try:
@@ -3461,7 +5074,13 @@ Rules:
                         data = recolor(data.decode("utf-8", "ignore")).encode("utf-8")
                     zout.writestr(item, data)
             shutil.move(tmp_path, output_path)
-            logger.info(f"Applied '{theme}' color theme to {output_path}")
+            logger.info(
+                "Applied '%s' color theme (primary=%s secondary=%s) to %s",
+                theme,
+                dst_primary,
+                dst_secondary,
+                output_path,
+            )
         except Exception as exc:
             logger.error(f"Failed to apply color theme '{theme}': {exc}")
 

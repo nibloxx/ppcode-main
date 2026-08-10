@@ -164,12 +164,41 @@ class CompExtractor:
                 if market_match.group(2):
                     comp.sub_market = market_match.group(2).strip()
             
-            # Extract all the numeric and property details with improved patterns
-            comp.comp_sf = self._extract_clean_field(text, r'Comp SF:\s*([0-9,]+(?:\s*SF)?)')
-            comp.acres = self._extract_clean_field(text, r'Acres:\s*([0-9.]+(?:\s*Acres)?)')
-            comp.sale_price = self._extract_clean_field(text, r'Sale Price:\s*(\$[0-9,]+)')
-            comp.sale_price_sf = self._extract_clean_field(text, r'Sale Price/SF:\s*(\$[0-9,.]+)')
-            comp.sale_price_acres = self._extract_clean_field(text, r'Sale Price/Acres:\s*(\$[0-9,.]+)')
+            # Extract all the numeric and property details with improved patterns.
+            # CoStar exports vary a lot across land/office summary layouts, so allow
+            # a few common label variants for the fields that drive valuation.
+            comp.comp_sf = self._extract_first_matching_field(
+                text,
+                [
+                    r'Comp SF:\s*([0-9,]+(?:\s*SF)?)',
+                    r'Building Size:\s*([0-9,]+(?:\s*SF)?)',
+                    r'Rentable Building Area:\s*([0-9,]+(?:\s*SF)?)',
+                ],
+            )
+            comp.acres = self._extract_first_matching_field(
+                text,
+                [r'Acres:\s*([0-9.]+(?:\s*Acres)?)'],
+            )
+            comp.sale_price = self._extract_first_matching_field(
+                text,
+                [
+                    r'Sale Price:\s*(\$[0-9,]+(?:\.[0-9]+)?)',
+                    r'Price:\s*(\$[0-9,]+(?:\.[0-9]+)?)',
+                ],
+            )
+            comp.sale_price_sf = self._extract_first_matching_field(
+                text,
+                [
+                    r'Sale Price/SF:\s*(\$[0-9,.]+(?:\s*/?\s*(?:SF|PSF))?)',
+                    r'Price/SF:\s*(\$[0-9,.]+(?:\s*/?\s*(?:SF|PSF))?)',
+                    r'Price per SF:\s*(\$[0-9,.]+(?:\s*/?\s*(?:SF|PSF))?)',
+                    r'Sale Price / SF:\s*(\$[0-9,.]+(?:\s*/?\s*(?:SF|PSF))?)',
+                ],
+            )
+            comp.sale_price_acres = self._extract_first_matching_field(
+                text,
+                [r'Sale Price/Acres:\s*(\$[0-9,.]+)'],
+            )
             comp.zoning = self._extract_clean_field(text, r'Zoning:\s*([^\n]+?)(?:\s*Off-Market:|$)')
             comp.parcel_number = self._extract_clean_field(text, r'Parcel #:\s*([^\n]+?)(?:\s*Lot Dimensions:|$)')
             comp.off_market_date = self._extract_clean_field(text, r'Off-Market:\s*(\d{2}/\d{2}/\d{4})')
@@ -251,6 +280,14 @@ class CompExtractor:
             value = re.sub(r'\s*SF\s*$', '', value)
             value = re.sub(r'\s*Acres\s*$', '', value)
             return value.strip()
+        return ""
+
+    def _extract_first_matching_field(self, text: str, patterns: List[str]) -> str:
+        """Return the first non-empty cleaned field across alternate regexes."""
+        for pattern in patterns:
+            value = self._extract_clean_field(text, pattern)
+            if value:
+                return value
         return ""
     
     def _extract_party(self, text: str, party_type: str) -> str:

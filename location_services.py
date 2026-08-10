@@ -96,53 +96,138 @@ class HybridLocationService:
             logger.info("Skipping Street View (GOOGLE_API_KEY not configured)")
             return None
 
-        location = (
-            f"{lat},{lng}" if lat is not None and lng is not None else address
+        # Prefer the typed address so imagery matches what the user entered.
+        # Lat/lng is a fallback when address lookup has no Street View coverage.
+        locations = []
+        if address:
+            locations.append(address.strip())
+        if lat is not None and lng is not None:
+            locations.append(f"{lat},{lng}")
+        # de-dupe while preserving order
+        seen = set()
+        locations = [loc for loc in locations if not (loc in seen or seen.add(loc))]
+
+        logger.info(
+            "Street View lookup for address=%r (also trying coords if needed)",
+            address,
         )
 
-        # Metadata check avoids embedding Google's "Sorry, we don't have imagery" placeholder
-        if not self._street_view_available(location):
-            logger.warning("Street View not available for location: %s", location)
-            return None
+        last_error = None
+        for location in locations:
+            # Metadata: only hard-skip when Google explicitly says no imagery.
+            # Timeouts/network errors should still try the image download.
+            meta = self._street_view_metadata(location)
+            if meta == "ZERO_RESULTS" or meta == "NOT_FOUND":
+                logger.warning(
+                    "Street View metadata=%s for %s — trying next location",
+                    meta,
+                    location,
+                )
+                continue
 
-        params = {
-            "size": "640x480",
-            "location": location,
-            "pitch": "0",
-            "fov": "90",
-            "source": "outdoor",
-            "key": self.google_api_key,
-        }
-        response = requests.get(GOOGLE_STREETVIEW_URL, params=params, timeout=30)
-        response.raise_for_status()
+            for source in ("outdoor", None):
+                try:
+                    params = {
+                        "size": "640x640",
+                        "location": location,
+                        "pitch": "0",
+                        "fov": "90",
+                        "key": self.google_api_key,
+                    }
+                    if source:
+                        params["source"] = source
+                    response = None
+                    for attempt in range(1, 4):
+                        try:
+                            response = requests.get(
+                                GOOGLE_STREETVIEW_URL, params=params, timeout=45
+                            )
+                            response.raise_for_status()
+                            break
+                        except Exception as exc:
+                            last_error = exc
+                            logger.warning(
+                                "Street View fetch attempt %s failed for %s: %s",
+                                attempt,
+                                location,
+                                exc,
+                            )
+                            if attempt < 3:
+                                continue
+                            response = None
+                    if response is None:
+                        continue
 
-        content_type = response.headers.get("content-type", "")
-        if not content_type.startswith("image/"):
-            logger.warning("Street View did not return an image for %s", location)
-            return None
+                    content_type = response.headers.get("content-type", "")
+                    if not content_type.startswith("image/"):
+                        logger.warning(
+                            "Street View did not return an image for %s", location
+                        )
+                        continue
 
-        # Reject tiny placeholder responses
-        if len(response.content) < 8000:
-            logger.warning("Street View response looks like a placeholder for %s", location)
-            return None
+                    # Reject tiny placeholder responses
+                    if len(response.content) < 8000:
+                        logger.warning(
+                            "Street View response looks like a placeholder for %s",
+                            location,
+                        )
+                        continue
 
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        output_path.write_bytes(response.content)
-        return str(output_path)
+                    output_path = Path(output_path)
+                    output_path.parent.mkdir(parents=True, exist_ok=True)
+                    data = response.content
+                    try:
+                        from io import BytesIO
+                        from PIL import Image
 
-    def _street_view_available(self, location: str) -> bool:
+                        img = Image.open(BytesIO(data)).convert("RGB")
+                        buf = BytesIO()
+                        img.save(buf, format="JPEG", quality=75, optimize=True)
+                        data = buf.getvalue()
+                    except Exception as exc:
+                        logger.warning("Could not recompress Street View image: %s", exc)
+                    output_path.write_bytes(data)
+                    logger.info(
+                        "Street View saved (%s bytes) for %s source=%s",
+                        len(data),
+                        location,
+                        source or "default",
+                    )
+                    return str(output_path)
+                except Exception as exc:
+                    last_error = exc
+                    logger.warning("Street View attempt failed for %s: %s", location, exc)
+
+        logger.warning(
+            "No Street View image available after retries (last error: %s)", last_error
+        )
+        return None
+
+    def _street_view_metadata(self, location: str) -> Optional[str]:
+        """Return Google metadata status, or None if the check itself failed."""
         try:
             response = requests.get(
                 f"{GOOGLE_STREETVIEW_URL}/metadata",
-                params={"location": location, "source": "outdoor", "key": self.google_api_key},
-                timeout=20,
+                params={
+                    "location": location,
+                    "source": "outdoor",
+                    "key": self.google_api_key,
+                },
+                timeout=45,
             )
             response.raise_for_status()
             status = (response.json() or {}).get("status", "")
-            return status == "OK"
+            return status or None
         except Exception as exc:
-            logger.warning("Street View metadata check failed: %s", exc)
-            return False
+            logger.warning(
+                "Street View metadata check failed (will still try image fetch): %s",
+                exc,
+            )
+            return None
+
+    def _street_view_available(self, location: str) -> bool:
+        status = self._street_view_metadata(location)
+        return status == "OK"
 
     def get_demographics(self, lat: float, lng: float) -> Dict:
         if not self.esri_api_key:
@@ -489,7 +574,7 @@ class HybridLocationService:
             "center": f"{lat},{lng}",
             "zoom": "18",
             "size": "640x640",
-            "scale": "2",
+            "scale": "1",
             "maptype": "hybrid",
             "key": self.google_api_key,
             "markers": f"color:red|{lat},{lng}",
@@ -511,7 +596,7 @@ class HybridLocationService:
 
                 img = Image.open(BytesIO(data)).convert("RGB")
                 buf = BytesIO()
-                img.save(buf, format="JPEG", quality=90)
+                img.save(buf, format="JPEG", quality=75, optimize=True)
                 data = buf.getvalue()
             except Exception as exc:
                 logger.warning("Could not convert Google aerial PNG to JPEG: %s", exc)

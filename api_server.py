@@ -30,12 +30,14 @@ TEMPLATE_PATH = BOV_TEMPLATE_PATH if Path(BOV_TEMPLATE_PATH).exists() else LEGAC
 COMP_TEMPLATE_PATH = "comptemplate.docx"
 
 PROSPECT_TEMPLATE_PATH = "bov_prospect_template.docx"
+SHORT_FORM_SOURCE = "New Template (BOV) - Short Form.docx"
 
 # Map request template names -> file paths
 TEMPLATE_CHOICES = {
     "bov": BOV_TEMPLATE_PATH,
     "client": BOV_TEMPLATE_PATH,
     "prospect": PROSPECT_TEMPLATE_PATH,
+    "short": PROSPECT_TEMPLATE_PATH,
     "legacy": LEGACY_TEMPLATE_PATH,
 }
 
@@ -52,12 +54,33 @@ def resolve_template(data: dict) -> str:
     if not requested:
         doc_type = (data.get("document_type") or data.get("documentType") or "").strip().lower()
         requested = DOCUMENT_TYPE_TEMPLATES.get(doc_type)
+        # Allow raw keys like "prospect" / "client" from API clients
+        if not requested and doc_type in TEMPLATE_CHOICES:
+            requested = doc_type
 
     if not requested:
-        return TEMPLATE_PATH
+        raise ValueError(
+            "Document type is required (BOV (Client) or BOV (Prospect))"
+        )
 
-    path = TEMPLATE_CHOICES.get(requested.lower(), requested)
-    return path if Path(path).exists() else TEMPLATE_PATH
+    path = TEMPLATE_CHOICES.get(str(requested).lower(), requested)
+    if Path(path).exists():
+        return path
+
+    # Auto-build prospect template from source short-form doc if needed
+    if str(requested).lower() in ("prospect", "short") and Path(SHORT_FORM_SOURCE).exists():
+        try:
+            from templatize_bov_prospect import main as build_prospect_template
+            build_prospect_template()
+            if Path(PROSPECT_TEMPLATE_PATH).exists():
+                logger.info("Built %s from %s", PROSPECT_TEMPLATE_PATH, SHORT_FORM_SOURCE)
+                return PROSPECT_TEMPLATE_PATH
+        except Exception as exc:
+            logger.warning("Could not build prospect template: %s", exc)
+
+    if Path(path).exists():
+        return path
+    raise ValueError(f"Template not found for document type: {requested!r}")
 
 # Initialize generators
 property_generator = None
@@ -117,6 +140,11 @@ def health_check():
     return jsonify({
         'status': 'healthy',
         'timestamp': datetime.now().isoformat(),
+        'build': 'prospect-fixes-2026-08-01',
+        'templates': {
+            'client': BOV_TEMPLATE_PATH if Path(BOV_TEMPLATE_PATH).exists() else None,
+            'prospect': PROSPECT_TEMPLATE_PATH if Path(PROSPECT_TEMPLATE_PATH).exists() else None,
+        },
         'property_generator': property_generator is not None,
         'comp_extractor': comp_extractor is not None,
         'property_generator_error': property_generator_init_error,
@@ -217,6 +245,21 @@ def generate_property_report():
 
         if not data or 'address' not in data:
             return jsonify({'error': 'Address is required'}), 400
+
+        # Require an explicit Client vs Prospect choice — empty used to silently
+        # fall back to the long Client template, so short-form fixes never ran.
+        doc_type_raw = (
+            data.get("document_type")
+            or data.get("documentType")
+            or data.get("template")
+            or data.get("report_template")
+            or ""
+        ).strip()
+        if not doc_type_raw:
+            return jsonify({
+                'error': 'Document type is required',
+                'details': 'Select BOV (Client) or BOV (Prospect) before generating.',
+            }), 400
         
         # Extract parameters with defaults
         address = data['address']
@@ -252,12 +295,30 @@ def generate_property_report():
                 comps = comp_extractor.extract_comps_from_pdf(str(pdf_path))
                 logger.info(f"Extracted {len(comps)} comps for BOV report")
         
+        comp_psf_stats = ComprehensivePropertyReportGenerator._comp_psf_stats(comps)
+        if comp_psf_stats:
+            logger.info(
+                "Uploaded comps average $/SF = $%.2f (min=$%.2f max=$%.2f n=%s)",
+                comp_psf_stats["avg"],
+                comp_psf_stats["min"],
+                comp_psf_stats["max"],
+                int(comp_psf_stats["count"]),
+            )
+
         logger.info(f"Generating property report for: {address}")
 
         # Select template from document_type / template (BOV Client vs Prospect)
-        template_path = resolve_template(data)
+        try:
+            template_path = resolve_template(data)
+        except ValueError as exc:
+            return jsonify({'error': str(exc)}), 400
         property_generator.template_path = Path(template_path)
-        logger.info(f"Using template: {template_path}")
+        logger.info(
+            "Using template: %s (document_type=%r template=%r)",
+            template_path,
+            data.get("document_type") or data.get("documentType"),
+            data.get("template") or data.get("report_template"),
+        )
         
         # Generate the report
         document_path = property_generator.process_single_property(
@@ -292,7 +353,8 @@ def generate_property_report():
             'message': 'Property report generated successfully',
             'document_path': document_path,
             'filename': filename,
-            'download_url': download_url
+            'download_url': download_url,
+            'comp_psf_stats': comp_psf_stats,
         })
         
     except Exception as e:
