@@ -273,8 +273,17 @@ def generate_property_report():
         prepared_for_address = data.get('prepared_for_address', '789 yellow street Provo, UT 12345')
         property_name = data.get('property_name', 'Property Report')
         property_type = data.get('property_type', 'Office')
-        lot_area = data.get('lot_area', '')
-        acres = data.get('acres', '')
+        # Accept common aliases for building/lot SF used in valuation math
+        lot_area = (
+            data.get('lot_area')
+            or data.get('gba')
+            or data.get('building_sf')
+            or data.get('building_area')
+            or data.get('gross_building_area')
+            or data.get('lotArea')
+            or ''
+        )
+        acres = data.get('acres', '') or data.get('Acres', '')
         recorded_sale_date = data.get('recorded_sale_date', '')
         zoning = data.get('zoning', '')
         apn = data.get('apn', '')

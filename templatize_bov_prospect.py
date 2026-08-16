@@ -137,9 +137,9 @@ TABLE_MAP = {
     (1, 1, 1): "{{market_price_psf}}/PSF X {{market_building_sf}}",
     (1, 1, 2): "{{market_value}}",
     (1, 2, 2): "{{market_value_rounded}}",
-    (1, 5, 0): "{{value_aggressive_psf}}",
-    (1, 5, 1): "{{market_price_psf}}/PSF",
-    (1, 5, 2): "{{value_conservative_psf}}",
+    (1, 5, 0): "{{value_aggressive}}",
+    (1, 5, 1): "{{market_value}}",
+    (1, 5, 2): "{{value_conservative}}",
     (2, 1, 1): "{{property_name}}",
     (2, 2, 1): "{{property_type}}",
     (2, 3, 1): "{{state}}",
@@ -164,9 +164,9 @@ TABLE_MAP = {
     (4, 1, 4): "{{market_building_sf}}",
     (4, 1, 6): "{{market_value}}",
     (4, 2, 6): "{{market_value_rounded}}",
-    (4, 5, 0): "{{value_aggressive_psf}}",
-    (4, 5, 3): "{{market_price_psf}}/PSF",
-    (4, 5, 4): "{{value_conservative_psf}}",
+    (4, 5, 0): "{{value_aggressive}}",
+    (4, 5, 3): "{{market_value}}",
+    (4, 5, 4): "{{value_conservative}}",
 }
 
 # Labels kept from short-form design; order matches body sections so live

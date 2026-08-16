@@ -643,7 +643,8 @@ Rules:
         property_data.market_recommendations = market_sections['market_recommendations']
         property_data.market_data_sources = market_sections['market_data_sources']
 
-        comp_context = self._format_comp_context(property_data.comps)
+        report_comps = self._select_report_comps(property_data.comps)
+        comp_context = self._format_comp_context(report_comps)
 
         # Generate additional BOV narrative sections
         property_data.executive_summary = self._get_ai_response(
@@ -669,14 +670,14 @@ Rules:
         # CLIENT layout: SALES CONCLUSION heading + OPINIONS OF VALUE table only
         # (no long narrative between/after those elements)
         property_data.sales_conclusion = ""
-        stats = self._comp_psf_stats(property_data.comps)
+        stats = self._comp_psf_stats(report_comps)
         recon_extra = ""
         if stats:
             recon_extra = (
                 f" You MUST cite the comparable $/SF range as "
                 f"${stats['min']:.2f} to ${stats['max']:.2f} and the average "
-                f"${stats['avg']:.2f}/SF from {int(stats['count'])} uploaded comps. "
-                f"Do not invent other $/SF figures."
+                f"${stats['avg']:.2f}/SF from {len(report_comps)} comparables "
+                f"shown in this report. Do not invent other $/SF figures or counts."
             )
         property_data.reconciliation_summary = self._get_ai_response(
             f"Write 2 short sentences for the RECONCILIATION TABLE narrative (above the valuation grid). "
@@ -713,6 +714,54 @@ Rules:
             )
         return "\n".join(lines) + "\n"
 
+    def _select_report_comps(
+        self, comps: List[Any], *, is_prospect: Optional[bool] = None
+    ) -> List[Any]:
+        """Comps that will actually appear in the Word report.
+
+        Matches `_insert_comparables`: unique CoStar page images, Prospect capped
+        at 2 pages. NOTES / valuation must use this subset — not every row
+        extracted from a long CoStar PDF.
+        """
+        if is_prospect is None:
+            is_prospect = self._is_prospect_run()
+
+        sorted_comps = sorted(
+            comps or [], key=lambda c: getattr(c, "comp_number", 0) or 0
+        )
+        if not sorted_comps:
+            return []
+
+        page_order: List[str] = []
+        comps_by_page: Dict[str, List[Any]] = {}
+        comps_without_image: List[Any] = []
+
+        for comp in sorted_comps:
+            image_path = (
+                getattr(comp, "page_image_path", None)
+                or getattr(comp, "image_path", None)
+            )
+            if image_path and os.path.exists(str(image_path)):
+                key = str(image_path)
+                if key not in comps_by_page:
+                    comps_by_page[key] = []
+                    page_order.append(key)
+                comps_by_page[key].append(comp)
+            else:
+                comps_without_image.append(comp)
+
+        if page_order:
+            prospect_comp_cap = 2
+            if is_prospect and len(page_order) > prospect_comp_cap:
+                page_order = page_order[:prospect_comp_cap]
+            selected: List[Any] = []
+            for path in page_order:
+                selected.extend(comps_by_page[path])
+            return selected
+
+        fallback_limit = 4 if is_prospect else 6
+        return sorted_comps[:fallback_limit]
+
     @staticmethod
     def _comp_psf_stats(comps: List[Any]) -> Optional[Dict[str, float]]:
         """Average / min / max Sale Price/SF from user-uploaded comps.
@@ -748,16 +797,31 @@ Rules:
             "count": float(len(values)),
         }
 
+    @staticmethod
+    def _is_blank_money_display(value: Any) -> bool:
+        """True when a formatted money cell is empty / placeholder dash."""
+        if value is None:
+            return True
+        text = str(value).strip()
+        if not text:
+            return True
+        return text in {"—", "–", "-", "N/A", "n/a", "NA", "$—", "$–", "$-"}
+
     def _build_reconciliation_notes(self, property_data: "PropertyReportData") -> str:
         """One-line NOTES cell for the valuation grid (CLIENT style)."""
-        comps = getattr(property_data, "comps", None) or []
-        n_comps = len(comps) if comps else 0
+        # Count / average only comps that appear on the report (not full PDF extract)
+        report_comps = self._select_report_comps(
+            getattr(property_data, "comps", None) or []
+        )
+        n_comps = len(report_comps)
 
         rounded = None
         # Prefer finalized valuation from table_values when available
         tv = getattr(property_data, "table_values", None) or {}
         rounded = tv.get("{{market_value_rounded}}")
-        if not rounded and getattr(property_data, "bov_dataset", None):
+        if self._is_blank_money_display(rounded):
+            rounded = None
+        if rounded is None and getattr(property_data, "bov_dataset", None):
             val = (property_data.bov_dataset or {}).get("valuation") or {}
             mv = val.get("market_value_rounded") or val.get("market_value")
             if mv is not None:
@@ -770,16 +834,19 @@ Rules:
             rounded = "the concluded market value"
 
         if n_comps > 0:
-            stats = self._comp_psf_stats(comps)
+            stats = self._comp_psf_stats(report_comps)
+            label = "comparable" if n_comps == 1 else "comparables"
             if stats:
+                # Prefer card count on the report over $/SF sample size when they differ
+                shown = n_comps
                 return (
                     f"The sales comparison approach yields a value of {rounded} "
                     f"based on the average ${stats['avg']:,.2f}/SF from "
-                    f"{int(stats['count'])} comparables."
+                    f"{shown} {label}."
                 )
             return (
                 f"The sales comparison approach yields a value of {rounded} "
-                f"based on the average $/SF from {n_comps} comparables."
+                f"based on the average $/SF from {n_comps} {label}."
             )
         return (
             f"The sales comparison approach yields a value of {rounded} "
@@ -1134,52 +1201,77 @@ Rules:
 
         dataset = self._generate_bov_demographics_ai(county, state, property_type)
 
-        # Use the entered GBA (Gross Building Area) to drive the valuation math.
-        # Market $/SF MUST come from the average Sale Price/SF of uploaded comps
-        # when available — never reuse a stale AI default (e.g. 265) across reports.
+        # Resolve building/lot SF for valuation. lot_area is the primary input
+        # (GBA or land SF); fall back to acres × 43,560 when SF was left blank.
         gba = self._to_number(property_data.lot_area)
-        if gba:
-            valuation = dataset.setdefault("valuation", {})
-            comp_stats = self._comp_psf_stats(property_data.comps)
-            if comp_stats:
-                price_psf = float(comp_stats["avg"])
+        if not gba:
+            acres_n = self._to_number(getattr(property_data, "acres", None))
+            if acres_n and acres_n > 0:
+                gba = float(acres_n) * 43560.0
                 logger.info(
-                    "Valuation $/SF from uploaded comps average: $%.2f "
-                    "(min=$%.2f max=$%.2f n=%s)",
-                    price_psf,
-                    comp_stats["min"],
-                    comp_stats["max"],
-                    int(comp_stats["count"]),
+                    "Valuation SF derived from acres: %s acres -> %s SF",
+                    acres_n,
+                    int(round(gba)),
                 )
             else:
-                price_psf = self._to_number(valuation.get("price_psf"))
-                if not price_psf:
-                    price_psf = 265.0
-                    logger.warning(
-                        "No comps $/SF available — using fallback $%.2f/SF", price_psf
-                    )
-                else:
-                    logger.warning(
-                        "No comps $/SF available — using AI valuation $%.2f/SF", price_psf
-                    )
+                logger.warning(
+                    "No lot_area/GBA or acres provided — market value totals "
+                    "cannot be computed (will show as —). $/SF from comps "
+                    "will still be filled when available."
+                )
 
-            valuation["building_sf"] = gba
+        valuation = dataset.setdefault("valuation", {})
+        report_comps = self._select_report_comps(property_data.comps)
+        comp_stats = self._comp_psf_stats(report_comps)
+
+        price_psf = None
+        if comp_stats:
+            price_psf = float(comp_stats["avg"])
+            logger.info(
+                "Valuation $/SF from report comps average: $%.2f "
+                "(min=$%.2f max=$%.2f n=%s shown=%s extracted=%s)",
+                price_psf,
+                comp_stats["min"],
+                comp_stats["max"],
+                int(comp_stats["count"]),
+                len(report_comps),
+                len(property_data.comps or []),
+            )
+        else:
+            price_psf = self._to_number(valuation.get("price_psf"))
+            if not price_psf and gba:
+                price_psf = 265.0
+                logger.warning(
+                    "No comps $/SF available — using fallback $%.2f/SF", price_psf
+                )
+            elif price_psf:
+                logger.warning(
+                    "No comps $/SF available — using AI valuation $%.2f/SF", price_psf
+                )
+
+        if price_psf:
             valuation["price_psf"] = round(float(price_psf), 2)
-            market_value = float(price_psf) * gba
+
+        if gba and price_psf:
+            valuation["building_sf"] = gba
+            market_value = float(price_psf) * float(gba)
             valuation["market_value"] = market_value
             valuation["market_value_rounded"] = round(market_value / 10000) * 10000
 
-            # Opinion band: prefer min/max of uploaded comps when we have a spread
+            # Opinion band: prefer min/max of report comps when we have a spread
             if (
                 comp_stats
                 and comp_stats["max"] > comp_stats["min"]
                 and int(comp_stats["count"]) >= 2
             ):
-                valuation["value_aggressive"] = round(float(comp_stats["max"]) * gba)
-                valuation["value_conservative"] = round(float(comp_stats["min"]) * gba)
+                valuation["value_aggressive"] = round(float(comp_stats["max"]) * float(gba))
+                valuation["value_conservative"] = round(float(comp_stats["min"]) * float(gba))
             else:
                 valuation["value_aggressive"] = round(market_value * 1.04)
                 valuation["value_conservative"] = round(market_value * 0.96)
+        elif gba:
+            # SF known but no $/SF — still surface building SF in the grid
+            valuation["building_sf"] = gba
 
         # Overlay real Esri ring demographics when available
         try:
@@ -2477,34 +2569,24 @@ Rules:
             return
         anchor = doc.paragraphs[heading_idx]
         is_prospect = self._is_prospect_run(doc)
-        sorted_comps = sorted(comps, key=lambda c: getattr(c, "comp_number", 0))
+        # Same subset used for NOTES count / valuation $/SF
+        report_comps = self._select_report_comps(comps, is_prospect=is_prospect)
 
         # One image per unique CoStar page (avoids duplicating 2-card pages)
         seen_paths = set()
         page_images = []
-        for comp in sorted_comps:
+        for comp in report_comps:
             image_path = (
                 getattr(comp, "page_image_path", None)
                 or getattr(comp, "image_path", None)
             )
             if not image_path or not os.path.exists(image_path):
                 continue
-            if image_path in seen_paths:
+            key = str(image_path)
+            if key in seen_paths:
                 continue
-            seen_paths.add(image_path)
+            seen_paths.add(key)
             page_images.append(image_path)
-
-        # Prospect is a 5–7 page short form — hard-cap CoStar pages so an
-        # 11-page comps PDF cannot balloon the report to ~18 pages.
-        prospect_comp_cap = 2
-        if is_prospect and len(page_images) > prospect_comp_cap:
-            logger.info(
-                "Prospect short-form: limiting comps pages %s -> %s (template=%s)",
-                len(page_images),
-                prospect_comp_cap,
-                self.template_path,
-            )
-            page_images = page_images[:prospect_comp_cap]
 
         if page_images:
             for image_path in page_images:
@@ -2535,9 +2617,8 @@ Rules:
             )
             return
 
-        # Fallback text details when no page images
-        fallback_limit = 4 if is_prospect else 6
-        for comp in sorted_comps[:fallback_limit]:
+        # Fallback text details when no page images (already capped in report_comps)
+        for comp in report_comps:
             title_p = self._insert_paragraph_after(anchor)
             name = getattr(comp, "property_name", "") or "Property"
             run = title_p.add_run(name)
@@ -2571,7 +2652,11 @@ Rules:
                 detail_p.add_run(line)
                 anchor = detail_p
 
-        logger.info("Inserted %d comparable properties into BOV report", len(sorted_comps))
+        logger.info(
+            "Inserted %d comparable properties into BOV report (extracted=%s)",
+            len(report_comps),
+            len(comps or []),
+        )
 
     @staticmethod
     def _comp_image_display_size(
@@ -3495,6 +3580,10 @@ Rules:
         else:
             # Even without uploaded comps, keep reconciliation on its own page
             self._ensure_page_break_before_heading(doc, "RECONCILIATION TABLE")
+
+        # Hard page-break + leftover decorative shapes after SUBJECT PHOTOS
+        # create a full blank page (Word / PDF / other devices).
+        self._remove_blank_page_after_subject_photos(doc)
 
         # Refresh employment table with recent-year data (client template only)
         if property_data.bov_dataset and not is_prospect:
@@ -4585,6 +4674,140 @@ Rules:
         else:
             logger.warning("Cover fix: Text Box 21 not found — cover photo not added")
 
+    def _remove_blank_page_after_subject_photos(self, doc: Document) -> None:
+        """Drop orphan page breaks / decorative shapes right after SUBJECT PHOTOS.
+
+        Templates sometimes keep a hard page break and leftover parallelogram /
+        rect decorations after SUBJECT PHOTOS. That produces a full blank page
+        with only header/footer — visible in Word, PDF, and on other devices.
+
+        Prospect: cleans through PROPERTY COMPARABLES.
+        Client: cleans through REGIONAL ANALYSIS (next body section).
+        """
+        from docx.oxml.ns import qn
+
+        stop_markers = (
+            "PROPERTY COMPARABLES",
+            "REGIONAL ANALYSIS",
+            "DEMOGRAPHIC ANALYSIS",
+            "RECONCILIATION TABLE",
+        )
+
+        paras = list(doc.paragraphs)
+        start = end = None
+        for i, p in enumerate(paras):
+            upper = (p.text or "").strip().upper()
+            if upper.startswith("SUBJECT PHOTOS"):
+                start = i
+            elif start is not None and any(upper.startswith(m) for m in stop_markers):
+                end = i
+                break
+        if start is None or end is None or end <= start + 1:
+            return
+
+        removed_shapes = 0
+        removed_breaks = 0
+        removed_empties = 0
+
+        zone = paras[start + 1 : end]
+        for p in zone:
+            for drawing in list(p._p.iter(qn("w:drawing"))):
+                docPr = next(drawing.iter(qn("wp:docPr")), None)
+                descr = (
+                    (docPr.get("descr") or "").lower() if docPr is not None else ""
+                )
+                name = (docPr.get("name") or "") if docPr is not None else ""
+                # Keep any drawing that is (or contains) a real photo placeholder
+                nested = " ".join(
+                    (dp.get("descr") or "").lower()
+                    for dp in drawing.iter(qn("wp:docPr"))
+                )
+                keep_tokens = (
+                    "subject_photo",
+                    "main_img",
+                    "aerial_image",
+                    "aerial",
+                )
+                if any(m in descr or m in nested for m in keep_tokens):
+                    continue
+                ext = next(drawing.iter(qn("wp:extent")), None)
+                cx = cy = 0.0
+                if ext is not None:
+                    cx = int(ext.get("cx") or 0) / 914400.0
+                    cy = int(ext.get("cy") or 0) / 914400.0
+                is_deco = "parallel" in name.lower()
+                is_huge = cx > 9 or cy > 6
+                # Only strip clear decorative leftovers — not unnamed small frames
+                if not (is_deco or is_huge):
+                    continue
+                parent = drawing.getparent()
+                if parent is not None:
+                    parent.remove(drawing)
+                    removed_shapes += 1
+
+        # Re-collect zone after shape stripping
+        paras = list(doc.paragraphs)
+        start = end = None
+        for i, p in enumerate(paras):
+            upper = (p.text or "").strip().upper()
+            if upper.startswith("SUBJECT PHOTOS"):
+                start = i
+            elif start is not None and any(upper.startswith(m) for m in stop_markers):
+                end = i
+                break
+        if start is None or end is None:
+            return
+
+        for p in list(paras[start + 1 : end]):
+            text = (p.text or "").strip()
+            has_drawing = any(True for _ in p._p.iter(qn("w:drawing")))
+            has_page_break = self._paragraph_has_page_break(p)
+            pPr = p._element.find(qn("w:pPr"))
+            has_sectpr = (
+                pPr is not None and pPr.find(qn("w:sectPr")) is not None
+            )
+            if has_sectpr:
+                continue
+            if has_page_break and not text and not has_drawing:
+                parent = p._element.getparent()
+                if parent is not None:
+                    parent.remove(p._element)
+                    removed_breaks += 1
+
+        # Collapse extra empties in the gap (keep at most one blank before next section)
+        paras = list(doc.paragraphs)
+        start = end = None
+        for i, p in enumerate(paras):
+            upper = (p.text or "").strip().upper()
+            if upper.startswith("SUBJECT PHOTOS"):
+                start = i
+            elif start is not None and any(upper.startswith(m) for m in stop_markers):
+                end = i
+                break
+        if start is None or end is None:
+            return
+        empties = []
+        for p in paras[start + 1 : end]:
+            text = (p.text or "").strip()
+            has_drawing = any(True for _ in p._p.iter(qn("w:drawing")))
+            has_page_break = self._paragraph_has_page_break(p)
+            if not text and not has_drawing and not has_page_break:
+                empties.append(p)
+        for p in empties[:-1] if len(empties) > 1 else []:
+            parent = p._element.getparent()
+            if parent is not None:
+                parent.remove(p._element)
+                removed_empties += 1
+
+        if removed_shapes or removed_breaks or removed_empties:
+            logger.info(
+                "Removed blank-page gap after SUBJECT PHOTOS: "
+                "shapes=%s pagebreaks=%s empties=%s",
+                removed_shapes,
+                removed_breaks,
+                removed_empties,
+            )
+
     def _ensure_page_break_before_heading(self, doc: Document, heading: str) -> None:
         """Insert a page break immediately before `heading` if one is missing.
 
@@ -4766,10 +4989,21 @@ Rules:
                 addr_placed += 1
                 continue
 
-            # Cover Street View slot must sit above the white corner group
+            # Cover Street View slot — keep above white corner; pin slightly higher
             if name == "Text Box 21" or "{{main_img}}" in (
                 (docPr.get("descr") or "")
             ):
+                if name == "Text Box 21":
+                    # Absolute Y (~7.07") — slightly above the old 7.35" slot
+                    top_emu = str(int(7.07 * 914400))
+                    posV = next(drawing.iter(qn("wp:positionV")), None)
+                    if posV is not None:
+                        for child in list(posV):
+                            if etree.QName(child).localname in ("posOffset", "align"):
+                                posV.remove(child)
+                        posV.set("relativeFrom", "page")
+                        off = etree.SubElement(posV, qn("wp:posOffset"))
+                        off.text = top_emu
                 anchor = next(
                     (a for a in drawing if etree.QName(a).localname == "anchor"),
                     None,
