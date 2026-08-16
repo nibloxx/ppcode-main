@@ -521,12 +521,26 @@ class CompExtractor:
                     out_path.name,
                 )
 
-            # Attach each unique page image to the first unmatched comp whose
-            # number appears on that page; then fall back by page order.
+            # Attach comps whose numbers appear on each page, capped by how many
+            # "N. Sold" cards that page actually contains (avoids NOTES saying 4
+            # when a 2-page insert only shows 3 cards).
             assigned = set()
             for page_num, path in page_paths.items():
                 text = pdf_document[page_num].get_text() or ""
-                matched = False
+                card_count = len(
+                    re.findall(r"(?m)^\s*\d+\.\s+Sold\b", text)
+                )
+                if card_count < 1:
+                    card_count = len(
+                        re.findall(
+                            r"\d+\.\s+Sold (?:Land )?(?:Property|Space|Building)",
+                            text,
+                        )
+                    )
+                if card_count < 1:
+                    card_count = 1
+
+                matched_comps = []
                 for comp in comps:
                     if comp.comp_number in assigned:
                         continue
@@ -536,33 +550,42 @@ class CompExtractor:
                         rf"\b{comp.comp_number}\.\s+Sold (?:Land )?(?:Property|Space|Building)",
                         text,
                     ):
-                        comp.page_image_path = path
-                        comp.image_path = path
-                        assigned.add(comp.comp_number)
-                        matched = True
-                        break
-                if not matched:
-                    # Page may hold 2+ comps — mark only once; insert dedupes by path
-                    for comp in comps:
-                        if comp.comp_number in assigned:
-                            continue
-                        if not comp.page_image_path:
-                            comp.page_image_path = path
-                            comp.image_path = path
-                            assigned.add(comp.comp_number)
-                            break
+                        matched_comps.append(comp)
 
-            # Any leftover comps get sequential leftover pages if available
-            leftover_pages = [p for p in unique_pages if p in page_paths]
-            li = 0
-            for comp in comps:
-                if comp.page_image_path:
-                    continue
-                if li < len(leftover_pages):
-                    path = page_paths[leftover_pages[li]]
+                for comp in matched_comps[:card_count]:
                     comp.page_image_path = path
                     comp.image_path = path
-                    li += 1
+                    assigned.add(comp.comp_number)
+                if matched_comps:
+                    logger.info(
+                        "CoStar page %s: %s card(s) in text, assigned comps %s",
+                        page_num + 1,
+                        card_count,
+                        [c.comp_number for c in matched_comps[:card_count]],
+                    )
+
+            # Leftovers: only attach to a page if that page still has no comps
+            # assigned (avoid stacking extra extracted rows onto a page that
+            # already has its real cards — that inflated NOTES to "4" when the
+            # PDF only showed 3).
+            comps_on_path: Dict[str, int] = {}
+            for comp in comps:
+                pth = getattr(comp, "page_image_path", None)
+                if pth:
+                    comps_on_path[pth] = comps_on_path.get(pth, 0) + 1
+
+            leftover_pages = [p for p in unique_pages if p in page_paths]
+            for page_num in leftover_pages:
+                path = page_paths[page_num]
+                if comps_on_path.get(path, 0) > 0:
+                    continue
+                for comp in comps:
+                    if comp.page_image_path:
+                        continue
+                    comp.page_image_path = path
+                    comp.image_path = path
+                    comps_on_path[path] = comps_on_path.get(path, 0) + 1
+                    break
 
             # Extra pages not yet attached — append stub comps so they appear in BOV
             attached_paths = {

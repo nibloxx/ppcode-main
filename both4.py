@@ -3607,6 +3607,9 @@ Rules:
         # Keep a blank line above section titles (e.g. after General Information table)
         for heading in self.SECTION_HEADINGS_NEEDING_SPACE:
             self._ensure_blank_before_heading(doc, heading)
+
+        # Center SALE OPINION OF VALUE labels + dollar amounts (Prospect + Client)
+        self._center_sale_opinion_cells(doc)
         
         # Remove the programmatic market analysis section since we're using placeholders
         # self._create_market_analysis_section(doc, property_data)
@@ -4465,6 +4468,7 @@ Rules:
         tb21 = None
         addr = None
         hero = None
+        prep_by = None
         for i in range(1, int(doc.Shapes.Count) + 1):
             shape = doc.Shapes(i)
             name = shape.Name or ""
@@ -4479,6 +4483,9 @@ Rules:
                     if not shape.TextFrame.HasText:
                         continue
                     text = (shape.TextFrame.TextRange.Text or "").strip()
+                    if text.upper().startswith("PREPARED BY"):
+                        prep_by = shape
+                        continue
                     if "PREPARED" in text.upper():
                         continue
                     if text and len(text) < 100 and any(ch.isdigit() for ch in text):
@@ -4508,6 +4515,19 @@ Rules:
                     addr = shape
                     break
 
+        if prep_by is None:
+            for i in range(1, int(doc.Shapes.Count) + 1):
+                shape = doc.Shapes(i)
+                try:
+                    if not shape.TextFrame.HasText:
+                        continue
+                    text = (shape.TextFrame.TextRange.Text or "").strip()
+                except Exception:
+                    continue
+                if text.upper().startswith("PREPARED BY"):
+                    prep_by = shape
+                    break
+
         if group is not None:
             try:
                 for j in range(1, int(group.GroupItems.Count) + 1):
@@ -4534,7 +4554,8 @@ Rules:
 
         # Template slot for cover photo (Text Box 21) — capture before parking it
         photo_left = -37.0
-        photo_top = 522.0
+        # Default aligns with PREPARED BY (~5.187" / 374pt)
+        photo_top = 374.0
         photo_width = 284.0
         photo_height = 233.0  # designed slot height (do not shrink to a short strip)
         if tb21 is not None:
@@ -4543,6 +4564,15 @@ Rules:
                 photo_top = float(tb21.Top)
                 photo_width = float(tb21.Width)
                 photo_height = float(tb21.Height)
+            except Exception:
+                pass
+        # Prefer PREPARED BY top so photo top matches the red-line / title height
+        if prep_by is not None:
+            try:
+                photo_top = float(prep_by.Top)
+                logger.info(
+                    "Cover photo top aligned to PREPARED BY at %.1f pt", photo_top
+                )
             except Exception:
                 pass
 
@@ -4808,6 +4838,65 @@ Rules:
                 removed_empties,
             )
 
+    def _center_sale_opinion_cells(self, doc: Document) -> None:
+        """Center Aggressive / Market Value / Conservative labels and amounts."""
+        from docx.enum.text import WD_ALIGN_PARAGRAPH
+        from docx.oxml import OxmlElement
+        from docx.oxml.ns import qn
+
+        def _center_para(paragraph) -> None:
+            paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            pPr = paragraph._element.get_or_add_pPr()
+            jc = pPr.find(qn("w:jc"))
+            if jc is None:
+                jc = OxmlElement("w:jc")
+                pPr.append(jc)
+            jc.set(qn("w:val"), "center")
+
+        centered = 0
+        for table in doc.tables:
+            flat = " ".join(
+                (c.text or "") for row in table.rows for c in row.cells
+            ).upper()
+            if "SALE OPINION OF VALUE" not in flat and "OPINIONS OF VALUE" not in flat:
+                continue
+
+            # Center Market Sale Price value cells (psf / sf / totals)
+            for row in table.rows:
+                row_text = " ".join((c.text or "") for c in row.cells).upper()
+                if "MARKET SALE" in row_text or "SALE OPINION" in row_text:
+                    for cell in row.cells:
+                        label = (cell.text or "").strip().upper()
+                        # Keep left labels; center values / header band
+                        if label in {
+                            "MARKET SALE PRICE",
+                            "MARKET SALES PRICE (ROUNDED)",
+                        }:
+                            continue
+                        for p in cell.paragraphs:
+                            _center_para(p)
+                            centered += 1
+
+            # Center the Aggressive / Market Value / Conservative block
+            header_row_idx = None
+            for ri, row in enumerate(table.rows):
+                texts = [(c.text or "").strip().lower() for c in row.cells]
+                if "aggressive" in texts or (
+                    "conservative" in texts and "market value" in texts
+                ):
+                    header_row_idx = ri
+                    break
+            if header_row_idx is None:
+                continue
+            for row in table.rows[header_row_idx : header_row_idx + 3]:
+                for cell in row.cells:
+                    for p in cell.paragraphs:
+                        _center_para(p)
+                        centered += 1
+
+        if centered:
+            logger.info("Centered %s SALE OPINION OF VALUE paragraph(s)", centered)
+
     def _ensure_page_break_before_heading(self, doc: Document, heading: str) -> None:
         """Insert a page break immediately before `heading` if one is missing.
 
@@ -4921,6 +5010,22 @@ Rules:
         primary, secondary = target
 
         title_shaped = date_shaped = title_whitened = addr_placed = 0
+        prep_by_top_emu = None
+
+        # Pass 1: locate PREPARED BY top (photo must match this — order in XML varies)
+        for drawing in doc.element.body.iter(qn("w:drawing")):
+            texts = " ".join(
+                (t.text or "") for t in drawing.iter(qn("w:t")) if t.text
+            ).strip()
+            if not texts.upper().startswith("PREPARED BY"):
+                continue
+            posV = next(drawing.iter(qn("wp:positionV")), None)
+            if posV is None:
+                continue
+            off = posV.find(qn("wp:posOffset"))
+            if off is not None and off.text:
+                prep_by_top_emu = off.text
+                break
 
         for drawing in doc.element.body.iter(qn("w:drawing")):
             docPr = next(drawing.iter(qn("wp:docPr")), None)
@@ -4989,13 +5094,17 @@ Rules:
                 addr_placed += 1
                 continue
 
-            # Cover Street View slot — keep above white corner; pin slightly higher
+            # Capture PREPARED BY top so the cover photo can align with it
+            if texts.upper().startswith("PREPARED BY"):
+                continue
+
+            # Cover Street View — top edge level with PREPARED BY title
             if name == "Text Box 21" or "{{main_img}}" in (
                 (docPr.get("descr") or "")
             ):
                 if name == "Text Box 21":
-                    # Absolute Y (~7.07") — slightly above the old 7.35" slot
-                    top_emu = str(int(7.07 * 914400))
+                    # Match PREPARED BY title top (fallback ~5.19" / 374pt)
+                    top_emu = prep_by_top_emu or str(int(5.187 * 914400))
                     posV = next(drawing.iter(qn("wp:positionV")), None)
                     if posV is not None:
                         for child in list(posV):
