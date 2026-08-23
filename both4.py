@@ -1258,17 +1258,25 @@ Rules:
             valuation["market_value"] = market_value
             valuation["market_value_rounded"] = round(market_value / 10000) * 10000
 
-            # Opinion band: prefer min/max of report comps when we have a spread
+            # Opinion band: prefer min/max of report comps when we have a spread.
+            # Round Aggressive / Conservative to nearest $10,000 (same as market rounded).
+            def _round_10k(amount: float) -> int:
+                return int(round(float(amount) / 10000.0) * 10000)
+
             if (
                 comp_stats
                 and comp_stats["max"] > comp_stats["min"]
                 and int(comp_stats["count"]) >= 2
             ):
-                valuation["value_aggressive"] = round(float(comp_stats["max"]) * float(gba))
-                valuation["value_conservative"] = round(float(comp_stats["min"]) * float(gba))
+                valuation["value_aggressive"] = _round_10k(
+                    float(comp_stats["max"]) * float(gba)
+                )
+                valuation["value_conservative"] = _round_10k(
+                    float(comp_stats["min"]) * float(gba)
+                )
             else:
-                valuation["value_aggressive"] = round(market_value * 1.04)
-                valuation["value_conservative"] = round(market_value * 0.96)
+                valuation["value_aggressive"] = _round_10k(market_value * 1.04)
+                valuation["value_conservative"] = _round_10k(market_value * 0.96)
         elif gba:
             # SF known but no $/SF — still surface building SF in the grid
             valuation["building_sf"] = gba
@@ -2447,6 +2455,7 @@ Rules:
         v["{{market_building_sf}}"] = num(val.get("building_sf"))
         v["{{market_value}}"] = money(val.get("market_value"))
         v["{{market_value_rounded}}"] = money(val.get("market_value_rounded"))
+        # SALE OPINION OF VALUE uses rounded band (nearest $10k)
         v["{{value_aggressive}}"] = money(val.get("value_aggressive"))
         v["{{value_conservative}}"] = money(val.get("value_conservative"))
         gba = self._to_number(val.get("building_sf"))
@@ -3608,8 +3617,15 @@ Rules:
         for heading in self.SECTION_HEADINGS_NEEDING_SPACE:
             self._ensure_blank_before_heading(doc, heading)
 
+        # Force Aggressive = high, Market = exact (rounded), Conservative = low
+        # by column label so scrambled template merges cannot swap them.
+        self._force_sale_opinion_column_values(doc, property_data)
         # Center SALE OPINION OF VALUE labels + dollar amounts (Prospect + Client)
         self._center_sale_opinion_cells(doc)
+        # Match VALUATION METHOD grid: full black cell borders on sales conclusion
+        self._apply_sales_conclusion_grid_borders(doc)
+        # Keep VALUATION METHOD and OPINIONS OF VALUE the same width / right edge
+        self._align_valuation_and_opinions_table_widths(doc)
         
         # Remove the programmatic market analysis section since we're using placeholders
         # self._create_market_analysis_section(doc, property_data)
@@ -4837,6 +4853,285 @@ Rules:
                 removed_breaks,
                 removed_empties,
             )
+
+    def _force_sale_opinion_column_values(
+        self, doc: Document, property_data: "PropertyReportData"
+    ) -> None:
+        """Write SALE OPINION amounts by column label (not cell index).
+
+        Aggressive = larger band, Market Value = exact market (10k-rounded),
+        Conservative = lower band. Fixes templates where merges swap columns.
+        """
+        tv = getattr(property_data, "table_values", None) or {}
+        aggressive = tv.get("{{value_aggressive}}")
+        market = tv.get("{{market_value_rounded}}") or tv.get("{{market_value}}")
+        conservative = tv.get("{{value_conservative}}")
+        if not any((aggressive, market, conservative)):
+            val = (getattr(property_data, "bov_dataset", None) or {}).get("valuation") or {}
+
+            def _money(v):
+                if v is None or v == "":
+                    return None
+                try:
+                    return f"${float(v):,.0f}"
+                except (TypeError, ValueError):
+                    return str(v)
+
+            aggressive = _money(val.get("value_aggressive"))
+            market = _money(val.get("market_value_rounded") or val.get("market_value"))
+            conservative = _money(val.get("value_conservative"))
+        if not any((aggressive, market, conservative)):
+            return
+
+        by_label = {
+            "aggressive": aggressive,
+            "market value": market,
+            "conservative": conservative,
+        }
+
+        def _unique_cells(row):
+            seen = set()
+            out = []
+            for cell in row.cells:
+                if id(cell._tc) in seen:
+                    continue
+                seen.add(id(cell._tc))
+                out.append(cell)
+            return out
+
+        def _set_cell_text(cell, text: str) -> None:
+            if text is None:
+                return
+            text = str(text)
+            if cell.paragraphs:
+                p = cell.paragraphs[0]
+                if p.runs:
+                    p.runs[0].text = text
+                    for run in p.runs[1:]:
+                        run.text = ""
+                else:
+                    p.add_run(text)
+                for extra in cell.paragraphs[1:]:
+                    for run in extra.runs:
+                        run.text = ""
+            else:
+                cell.text = text
+
+        fixed = 0
+        for table in doc.tables:
+            flat = " ".join(
+                (c.text or "") for row in table.rows for c in row.cells
+            ).upper()
+            if "SALE OPINION OF VALUE" not in flat:
+                continue
+            if "AGGRESSIVE" not in flat or "CONSERVATIVE" not in flat:
+                continue
+
+            header_idx = None
+            label_order = []  # list of (col_index, label_key)
+            for ri, row in enumerate(table.rows):
+                cells = _unique_cells(row)
+                texts = [(c.text or "").strip().lower() for c in cells]
+                if "aggressive" not in texts:
+                    continue
+                if "market value" not in texts and "conservative" not in texts:
+                    continue
+                for ci, text in enumerate(texts):
+                    if text in by_label:
+                        label_order.append((ci, text))
+                if label_order:
+                    header_idx = ri
+                    break
+            if header_idx is None or not label_order:
+                continue
+
+            # Prefer the next row; otherwise search nearby for dollar/placeholder cells
+            value_row = None
+            for ri in range(header_idx + 1, min(header_idx + 3, len(table.rows))):
+                cells = _unique_cells(table.rows[ri])
+                joined = " ".join((c.text or "") for c in cells).lower()
+                if "sale opinion" in joined or "aggressive" in joined:
+                    continue
+                value_row = cells
+                break
+            if not value_row:
+                continue
+
+            for ci, label in label_order:
+                if ci >= len(value_row):
+                    continue
+                amount = by_label.get(label)
+                if not amount:
+                    continue
+                _set_cell_text(value_row[ci], amount)
+                fixed += 1
+
+        if fixed:
+            logger.info(
+                "Forced SALE OPINION columns by label (%s cells): "
+                "Aggressive=%s Market=%s Conservative=%s",
+                fixed,
+                aggressive,
+                market,
+                conservative,
+            )
+
+    def _align_valuation_and_opinions_table_widths(self, doc: Document) -> None:
+        """Make OPINIONS OF VALUE match VALUATION METHOD table width/right edge.
+
+        Prospect short-form left the opinions table on auto width, so Word
+        stretched it past the fixed valuation table above.
+        """
+        from docx.oxml import OxmlElement
+        from docx.oxml.ns import qn
+
+        def _flat(table) -> str:
+            return " ".join(
+                (c.text or "") for row in table.rows for c in row.cells
+            ).upper()
+
+        valuation = None
+        opinions = None
+        for table in doc.tables:
+            flat = _flat(table)
+            if valuation is None and "VALUATION METHOD" in flat and "VALUE ESTIMATE" in flat:
+                valuation = table
+            if opinions is None and "OPINIONS OF VALUE" in flat and "MARKET SALE PRICE" in flat:
+                opinions = table
+        if valuation is None or opinions is None:
+            return
+
+        src_pr = valuation._tbl.tblPr
+        dst_pr = opinions._tbl.tblPr
+        if src_pr is None or dst_pr is None:
+            return
+
+        src_w = src_pr.find(qn("w:tblW"))
+        if src_w is None:
+            return
+        width = src_w.get(qn("w:w"))
+        wtype = src_w.get(qn("w:type")) or "dxa"
+        if not width:
+            return
+
+        dst_w = dst_pr.find(qn("w:tblW"))
+        if dst_w is None:
+            dst_w = OxmlElement("w:tblW")
+            dst_pr.append(dst_w)
+        dst_w.set(qn("w:w"), width)
+        dst_w.set(qn("w:type"), wtype)
+
+        layout = dst_pr.find(qn("w:tblLayout"))
+        if layout is None:
+            layout = OxmlElement("w:tblLayout")
+            dst_pr.append(layout)
+        layout.set(qn("w:type"), "fixed")
+
+        # Drop indent mismatch if present
+        for pr in (src_pr, dst_pr):
+            ind = pr.find(qn("w:tblInd"))
+            if ind is not None:
+                # Keep source indent on both so left edges match too
+                pass
+        src_ind = src_pr.find(qn("w:tblInd"))
+        dst_ind = dst_pr.find(qn("w:tblInd"))
+        if src_ind is not None:
+            if dst_ind is None:
+                dst_ind = OxmlElement("w:tblInd")
+                dst_pr.append(dst_ind)
+            for attr in ("w", "type"):
+                val = src_ind.get(qn(f"w:{attr}"))
+                if val is not None:
+                    dst_ind.set(qn(f"w:{attr}"), val)
+        elif dst_ind is not None:
+            dst_pr.remove(dst_ind)
+
+        # Scale destination grid columns to the valuation table total width
+        try:
+            target = int(width)
+        except ValueError:
+            return
+        dst_grid = opinions._tbl.find(qn("w:tblGrid"))
+        if dst_grid is not None:
+            cols = list(dst_grid.findall(qn("w:gridCol")))
+            cur = sum(int(c.get(qn("w:w")) or 0) for c in cols)
+            if cols and cur > 0 and cur != target:
+                acc = 0
+                for i, col in enumerate(cols):
+                    if i == len(cols) - 1:
+                        new_w = max(1, target - acc)
+                    else:
+                        new_w = max(1, int(round(int(col.get(qn("w:w")) or 0) * target / cur)))
+                        acc += new_w
+                    col.set(qn("w:w"), str(new_w))
+
+        logger.info(
+            "Aligned OPINIONS OF VALUE table width to VALUATION METHOD (%s %s)",
+            width,
+            wtype,
+        )
+
+    def _apply_sales_conclusion_grid_borders(self, doc: Document) -> None:
+        """Give OPINIONS OF VALUE / SALE OPINION tables the same black grid as
+        the VALUATION METHOD table (Table Grid style lines)."""
+        from docx.oxml import OxmlElement
+        from docx.oxml.ns import qn
+
+        def _set_border(element, tag: str) -> None:
+            el = element.find(qn(f"w:{tag}"))
+            if el is None:
+                el = OxmlElement(f"w:{tag}")
+                element.append(el)
+            el.set(qn("w:val"), "single")
+            el.set(qn("w:sz"), "8")  # 1/8 pt units → 1pt
+            el.set(qn("w:space"), "0")
+            el.set(qn("w:color"), "000000")
+
+        def _grid_borders(container) -> None:
+            for edge in ("top", "left", "bottom", "right", "insideH", "insideV"):
+                _set_border(container, edge)
+
+        touched = 0
+        for table in doc.tables:
+            flat = " ".join(
+                (c.text or "") for row in table.rows for c in row.cells
+            ).upper()
+            if "OPINIONS OF VALUE" not in flat and "SALE OPINION OF VALUE" not in flat:
+                continue
+            if "MARKET SALE PRICE" not in flat and "AGGRESSIVE" not in flat:
+                continue
+
+            tblPr = table._tbl.tblPr
+            if tblPr is None:
+                tblPr = OxmlElement("w:tblPr")
+                table._tbl.insert(0, tblPr)
+            borders = tblPr.find(qn("w:tblBorders"))
+            if borders is None:
+                borders = OxmlElement("w:tblBorders")
+                tblPr.append(borders)
+            else:
+                # Clear "none" borders left by the short-form template
+                for child in list(borders):
+                    borders.remove(child)
+            _grid_borders(borders)
+
+            # Also force per-cell borders so merged cells still draw a grid
+            for row in table.rows:
+                for cell in row.cells:
+                    tcPr = cell._tc.get_or_add_tcPr()
+                    tcBorders = tcPr.find(qn("w:tcBorders"))
+                    if tcBorders is None:
+                        tcBorders = OxmlElement("w:tcBorders")
+                        tcPr.append(tcBorders)
+                    else:
+                        for child in list(tcBorders):
+                            tcBorders.remove(child)
+                    for edge in ("top", "left", "bottom", "right"):
+                        _set_border(tcBorders, edge)
+            touched += 1
+
+        if touched:
+            logger.info("Applied grid borders to %s sales-conclusion table(s)", touched)
 
     def _center_sale_opinion_cells(self, doc: Document) -> None:
         """Center Aggressive / Market Value / Conservative labels and amounts."""

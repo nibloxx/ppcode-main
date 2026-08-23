@@ -138,7 +138,7 @@ TABLE_MAP = {
     (1, 1, 2): "{{market_value}}",
     (1, 2, 2): "{{market_value_rounded}}",
     (1, 5, 0): "{{value_aggressive}}",
-    (1, 5, 1): "{{market_value}}",
+    (1, 5, 1): "{{market_value_rounded}}",
     (1, 5, 2): "{{value_conservative}}",
     (2, 1, 1): "{{property_name}}",
     (2, 2, 1): "{{property_type}}",
@@ -165,7 +165,7 @@ TABLE_MAP = {
     (4, 1, 6): "{{market_value}}",
     (4, 2, 6): "{{market_value_rounded}}",
     (4, 5, 0): "{{value_aggressive}}",
-    (4, 5, 3): "{{market_value}}",
+    (4, 5, 3): "{{market_value_rounded}}",
     (4, 5, 4): "{{value_conservative}}",
 }
 
@@ -651,6 +651,106 @@ def compress_embedded_images(doc, max_edge: int = 1200, quality: int = 70) -> in
     return compressed
 
 
+def rebuild_sale_opinion_block(doc: Document) -> int:
+    """Normalize SALE OPINION OF VALUE to Aggressive | Market Value | Conservative.
+
+    The short-form source has scrambled merges that put Market under Aggressive.
+    Rebuild those three rows as a clean labeled grid with rounded placeholders.
+    """
+    from lxml import etree
+
+    def make_tc(text, span, fill=None, bold=False, color=None):
+        tc = etree.Element(qn("w:tc"))
+        tcPr = etree.SubElement(tc, qn("w:tcPr"))
+        etree.SubElement(tcPr, qn("w:tcW"), {
+            qn("w:w"): str(1200 * span),
+            qn("w:type"): "dxa",
+        })
+        if span > 1:
+            etree.SubElement(tcPr, qn("w:gridSpan"), {qn("w:val"): str(span)})
+        borders = etree.SubElement(tcPr, qn("w:tcBorders"))
+        for edge in ("top", "left", "bottom", "right"):
+            etree.SubElement(borders, qn(f"w:{edge}"), {
+                qn("w:val"): "single",
+                qn("w:sz"): "4",
+                qn("w:space"): "0",
+                qn("w:color"): "000000",
+            })
+        if fill:
+            etree.SubElement(tcPr, qn("w:shd"), {
+                qn("w:val"): "clear",
+                qn("w:color"): "auto",
+                qn("w:fill"): fill,
+            })
+        etree.SubElement(tcPr, qn("w:vAlign"), {qn("w:val"): "center"})
+        p = etree.SubElement(tc, qn("w:p"))
+        pPr = etree.SubElement(p, qn("w:pPr"))
+        etree.SubElement(pPr, qn("w:jc"), {qn("w:val"): "center"})
+        r = etree.SubElement(p, qn("w:r"))
+        rPr = etree.SubElement(r, qn("w:rPr"))
+        if bold:
+            etree.SubElement(rPr, qn("w:b"))
+        if color:
+            etree.SubElement(rPr, qn("w:color"), {qn("w:val"): color})
+        etree.SubElement(rPr, qn("w:sz"), {qn("w:val"): "18"})
+        t = etree.SubElement(r, qn("w:t"))
+        t.text = text
+        t.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
+        return tc
+
+    def make_tr(cells):
+        tr = etree.Element(qn("w:tr"))
+        trPr = etree.SubElement(tr, qn("w:trPr"))
+        etree.SubElement(trPr, qn("w:trHeight"), {
+            qn("w:val"): "200",
+            qn("w:hRule"): "atLeast",
+        })
+        for c in cells:
+            tr.append(c)
+        return tr
+
+    fixed = 0
+    for table in doc.tables:
+        flat = " ".join(c.text for r in table.rows for c in r.cells).upper()
+        if "OPINIONS OF VALUE" not in flat or "SALE OPINION OF VALUE" not in flat:
+            continue
+        if len(table.rows) < 6:
+            continue
+
+        fill = "0070C0"
+        for c in table.rows[0].cells:
+            shd = c._tc.find(qn("w:tcPr"))
+            if shd is not None:
+                s = shd.find(qn("w:shd"))
+                if s is not None and s.get(qn("w:fill")):
+                    fill = s.get(qn("w:fill"))
+                    break
+
+        header = make_tr([
+            make_tc("SALE OPINION OF VALUE", 8, fill=fill, bold=True, color="FFFFFF")
+        ])
+        labels = make_tr([
+            make_tc("Aggressive", 3, bold=True),
+            make_tc("Market Value", 3, bold=True),
+            make_tc("Conservative", 2, bold=True),
+        ])
+        values = make_tr([
+            make_tc("{{value_aggressive}}", 3),
+            make_tc("{{market_value_rounded}}", 3),
+            make_tc("{{value_conservative}}", 2),
+        ])
+
+        tbl = table._tbl
+        trs = list(tbl.findall(qn("w:tr")))
+        for idx, new_tr in ((3, header), (4, labels), (5, values)):
+            if idx >= len(trs):
+                break
+            old = trs[idx]
+            old.getparent().replace(old, new_tr)
+        fixed += 1
+    return fixed
+
+
 def main():
     doc = Document(SOURCE)
     healed = heal_textbox_placeholders(doc)
@@ -667,6 +767,7 @@ def main():
         except IndexError:
             print(f"  WARN: cell {(ti, ri, ci)} out of range")
 
+    opinion_fixed = rebuild_sale_opinion_block(doc)
     fix_toc_table(doc)
     replace_narratives(doc)
 
@@ -682,7 +783,7 @@ def main():
         f"Wrote {OUTPUT}: healed={healed}, header_pairs={headers}, "
         f"image_tags={img_tags}, images_compressed={img_compressed}, "
         f"cover_aligned={cover_aligned}, header_footer={hf_ok}, "
-        f"cells={cells}, tables={len(doc.tables)}, "
+        f"cells={cells}, opinion_fixed={opinion_fixed}, tables={len(doc.tables)}, "
         f"paragraphs={len(doc.paragraphs)}"
     )
 
