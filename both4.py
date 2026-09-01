@@ -3129,6 +3129,10 @@ Rules:
             # Stretch nested picture to the textbox extent so no white matte shows
             self._fit_picture_to_textbox(drawing)
 
+    def _hide_duplicate_cover_main_img(self, doc: Document) -> None:
+        """No-op: cover duplicates are prevented by not calling AddPicture."""
+        return
+
     @staticmethod
     def _fit_picture_to_textbox(drawing) -> None:
         """Make nested pic:spPr / wp:extent match the outer textbox size."""
@@ -3620,6 +3624,10 @@ Rules:
         # Force Aggressive = high, Market = exact (rounded), Conservative = low
         # by column label so scrambled template merges cannot swap them.
         self._force_sale_opinion_column_values(doc, property_data)
+        # Merge $/SF X SF into one centered cell (and match SALE OPINION font)
+        self._merge_opinions_formula_cells(doc, property_data)
+        # Match SALE OPINION font size + row height to OPINIONS rows above
+        self._sync_sale_opinion_typography(doc)
         # Center SALE OPINION OF VALUE labels + dollar amounts (Prospect + Client)
         self._center_sale_opinion_cells(doc)
         # Match VALUATION METHOD grid: full black cell borders on sales conclusion
@@ -3655,6 +3663,11 @@ Rules:
         # Apply color theme to the report accent (post-process the saved file)
         if color_theme:
             self._apply_color_theme(output_path, color_theme)
+            # Theme zip rewrite must not leave the title black — re-assert white.
+            try:
+                self._fix_cover_after_word_com(output_path, cover_photo)
+            except Exception as exc:
+                logger.warning("Post-theme cover title whiten failed: %s", exc)
 
         return str(output_path)
 
@@ -3725,26 +3738,49 @@ Rules:
         )
 
         # --- 2) White title text on "Broker Opinion of Value" ---
-        # Replace existing w:color (do NOT add a second w:color — Word rejects that)
+        # COM often leaves black / theme text; force FFFFFF on every matching run.
         def _whiten_title_rpr(m: re.Match) -> str:
             rpr, rest = m.group(1), m.group(2)
-            if re.search(r'<w:color\b', rpr):
+            if re.search(r"<w:color\b", rpr):
                 rpr = re.sub(
-                    r'<w:color\b[^>]*/>',
+                    r"<w:color\b[^>]*/>",
                     '<w:color w:val="FFFFFF"/>',
                     rpr,
                     count=1,
                 )
             else:
                 rpr = rpr + '<w:color w:val="FFFFFF"/>'
+            # Drop theme color hints that can override w:val in Word
+            rpr = re.sub(r'\s+w:themeColor="[^"]*"', "", rpr)
+            rpr = re.sub(r'\s+w:themeTint="[^"]*"', "", rpr)
+            rpr = re.sub(r'\s+w:themeShade="[^"]*"', "", rpr)
             return rpr + rest
 
-        xml = re.sub(
-            r"(<w:rPr>(?:(?!</w:rPr>).)*?)(</w:rPr>\s*<w:t[^>]*>Broker Opinion of Value</w:t>)",
+        xml2, n_white = re.subn(
+            r"(<w:rPr>(?:(?!</w:rPr>).)*?)(</w:rPr>\s*<w:t[^>]*>\s*Broker Opinion of Value\s*</w:t>)",
             _whiten_title_rpr,
             xml,
             flags=re.DOTALL,
         )
+        if n_white:
+            xml = xml2
+            logger.info(
+                "Cover repair: whitened Broker Opinion title in %s rPr(s)", n_white
+            )
+        else:
+            # Runs with no rPr yet — insert one before the title text
+            xml2, n_ins = re.subn(
+                r"(<w:r>)(\s*<w:t[^>]*>\s*Broker Opinion of Value\s*</w:t>)",
+                r'\1<w:rPr><w:color w:val="FFFFFF"/></w:rPr>\2',
+                xml,
+                count=4,
+            )
+            if n_ins:
+                xml = xml2
+                logger.info(
+                    "Cover repair: inserted white color on %s Broker Opinion run(s)",
+                    n_ins,
+                )
 
         # --- 3) Strip unsafe VML image injects from older broken builds ---
         xml2, n_strip = re.subn(
@@ -4469,22 +4505,26 @@ Rules:
             except Exception:
                 pass
 
-    def _word_fix_cover_shapes(self, doc, street_view_path: Optional[str] = None) -> None:
-        """Restore cover corner + property photo using Word's shape API (safe OOXML).
+        # COM can still leave title color black in the package XML — force white.
+        try:
+            self._fix_cover_after_word_com(output_path, street_view_path)
+        except Exception as exc:
+            logger.warning("Post-COM cover XML repair failed: %s", exc)
 
-        Group 13 children ship with Fill.Visible=False after open; Text Box 21
-        loses its picture. Avoid ZOrder/Delete (crash Word 2007) — AddPicture
-        places the Street View on top of the white corner shapes.
+    def _word_fix_cover_shapes(self, doc, street_view_path: Optional[str] = None) -> None:
+        """Whiten cover corner + remove duplicate Street Views only.
+
+        Text Box 21 is already filled by the {{main_img}} byte-swap. Do not move
+        it or AddPicture — that stacked a second photo and shifted the Client
+        cover image out of its template slot.
         """
-        sv = None
-        if street_view_path and Path(street_view_path).exists():
-            sv = str(Path(street_view_path).resolve())
+        # street_view_path kept for call-site compatibility; photo bytes already
+        # live in Text Box 21 from _replace_textbox_images.
+        _ = street_view_path
 
         group = None
         tb21 = None
         addr = None
-        hero = None
-        prep_by = None
         for i in range(1, int(doc.Shapes.Count) + 1):
             shape = doc.Shapes(i)
             name = shape.Name or ""
@@ -4492,17 +4532,12 @@ Rules:
                 group = shape
             elif name == "Text Box 21":
                 tb21 = shape
-            elif name == "Picture 8":
-                hero = shape
             elif name == "Text Box 26":
                 try:
                     if not shape.TextFrame.HasText:
                         continue
                     text = (shape.TextFrame.TextRange.Text or "").strip()
-                    if text.upper().startswith("PREPARED BY"):
-                        prep_by = shape
-                        continue
-                    if "PREPARED" in text.upper():
+                    if text.upper().startswith("PREPARED"):
                         continue
                     if text and len(text) < 100 and any(ch.isdigit() for ch in text):
                         addr = shape
@@ -4531,19 +4566,6 @@ Rules:
                     addr = shape
                     break
 
-        if prep_by is None:
-            for i in range(1, int(doc.Shapes.Count) + 1):
-                shape = doc.Shapes(i)
-                try:
-                    if not shape.TextFrame.HasText:
-                        continue
-                    text = (shape.TextFrame.TextRange.Text or "").strip()
-                except Exception:
-                    continue
-                if text.upper().startswith("PREPARED BY"):
-                    prep_by = shape
-                    break
-
         if group is not None:
             try:
                 for j in range(1, int(group.GroupItems.Count) + 1):
@@ -4558,47 +4580,60 @@ Rules:
             except Exception as exc:
                 logger.warning("Cover fix: could not whiten Group 13: %s", exc)
 
-        # Desired cover (mock): address nestled in the WHITE DIAGONAL CORNER
-        # (left wedge under the slant), photo in the lower-left slot — separate.
-        # Do NOT stack photo tightly under address (that reads as one mixed block).
-        hero_bottom = 438.0
-        if hero is not None:
-            try:
-                hero_bottom = float(hero.Top) + float(hero.Height)
-            except Exception:
-                pass
+        # Force "Broker Opinion of Value" title text to white (COM often resets it
+        # to black after converting DrawingML → VML).
+        try:
+            for i in range(1, int(doc.Shapes.Count) + 1):
+                shape = doc.Shapes(i)
+                try:
+                    if not shape.TextFrame.HasText:
+                        continue
+                    text = (shape.TextFrame.TextRange.Text or "").replace("\r", " ")
+                except Exception:
+                    continue
+                if "Broker Opinion of Value" not in text:
+                    continue
+                rng = shape.TextFrame.TextRange
+                rng.Font.Color = 16777215  # white
+                try:
+                    rng.Font.Bold = True
+                except Exception:
+                    pass
+                logger.info(
+                    "Cover fix: set 'Broker Opinion of Value' font to white on %s",
+                    shape.Name or f"Shape{i}",
+                )
+        except Exception as exc:
+            logger.warning("Cover fix: could not whiten title text: %s", exc)
 
-        # Template slot for cover photo (Text Box 21) — capture before parking it
-        photo_left = -37.0
-        # Default aligns with PREPARED BY (~5.187" / 374pt)
-        photo_top = 374.0
-        photo_width = 284.0
-        photo_height = 233.0  # designed slot height (do not shrink to a short strip)
+        # Desired cover: keep Text Box 21 in its TEMPLATE slot. Only remove
+        # duplicate Street Views that AddPicture used to stack on top of it.
+        # Do NOT move the photo to PREPARED BY / re-place it — that shifted the
+        # Client (20-25 page) cover image up into the hero header.
         if tb21 is not None:
             try:
-                photo_left = float(tb21.Left)
-                photo_top = float(tb21.Top)
-                photo_width = float(tb21.Width)
-                photo_height = float(tb21.Height)
-            except Exception:
-                pass
-        # Prefer PREPARED BY top so photo top matches the red-line / title height
-        if prep_by is not None:
-            try:
-                photo_top = float(prep_by.Top)
-                logger.info(
-                    "Cover photo top aligned to PREPARED BY at %.1f pt", photo_top
-                )
+                tb21.Line.Visible = 0
             except Exception:
                 pass
 
-        # Address in diagonal white corner: flush left, tall enough for 2 full lines.
-        addr_top = min(365.0, hero_bottom - 70.0)
-        addr_left = min(-10.0, photo_left + 10.0)  # more left, near photo column
+        # Delete leftover CoverStreetView shapes from older AddPicture runs
+        removed_dupes = 0
+        try:
+            for i in range(int(doc.Shapes.Count), 0, -1):
+                shape = doc.Shapes(i)
+                name = (shape.Name or "").strip()
+                if name == "CoverStreetView":
+                    shape.Delete()
+                    removed_dupes += 1
+        except Exception as exc:
+            logger.warning("Cover fix: could not remove duplicate CoverStreetView: %s", exc)
+
+        # Address: format text only — do NOT move Text Box 26.
+        # Template slot is ~294pt (above photo ~373pt). Moving it put the
+        # address on top of the Street View.
         if addr is not None:
             try:
                 raw = (addr.TextFrame.TextRange.Text or "").replace("\r", "").strip()
-                # Collapse soft breaks then re-split to street / city lines
                 raw = raw.replace("\v", " ").replace("\n", " ")
                 while "  " in raw:
                     raw = raw.replace("  ", " ")
@@ -4611,13 +4646,9 @@ Rules:
                     addr.TextFrame.TextRange.Text = f"{parts[0]},\r{parts[1]}"
                 try:
                     addr.Line.Visible = 0
-                except Exception:
-                    pass
-                try:
                     addr.Fill.Visible = 0
                 except Exception:
                     pass
-                # Tight margins so both lines fit and text sits flush left
                 try:
                     tf = addr.TextFrame
                     tf.MarginLeft = 2.0
@@ -4627,98 +4658,49 @@ Rules:
                     tf.WordWrap = True
                 except Exception:
                     pass
-                addr.Left = addr_left
-                addr.Top = addr_top
+                # Align with cover Street View left edge (Text Box 21 ≈ -32.6pt),
+                # not the old -64pt hang that sat too far left vs the short template.
                 try:
-                    addr.Width = 300.0
-                    # ~2 lines @ ~14–16pt + margins — 48pt was clipping line 2
-                    addr.Height = 72.0
+                    # wdRelativeHorizontalPositionColumn = 2
+                    # wdRelativeVerticalPositionParagraph = 3
+                    addr.RelativeHorizontalPosition = 2
+                    addr.RelativeVerticalPosition = 3
+                    photo_left = -32.63
+                    if tb21 is not None:
+                        try:
+                            photo_left = float(tb21.Left)
+                        except Exception:
+                            pass
+                    addr.Left = photo_left
+                    addr.Top = 294.1
+                    addr.Width = 312.6
+                    addr.Height = 68.4
+                except Exception:
+                    pass
+                try:
+                    addr.ZOrder(0)  # msoBringToFront
                 except Exception:
                     pass
                 logger.info(
-                    "Cover fix: address L=%.1f T=%.1f H=%.1f (hero_bot=%.1f)",
+                    "Cover fix: address aligned to photo left L=%.1f T=%.1f",
                     float(addr.Left),
                     float(addr.Top),
-                    float(addr.Height),
-                    hero_bottom,
                 )
             except Exception as exc:
-                logger.warning("Cover fix: address move failed: %s", exc)
+                logger.warning("Cover fix: address restore failed: %s", exc)
 
-        if sv and tb21 is not None:
-            # Designed lower-left photo slot — keep near-template height
-            left = photo_left if photo_left > -200 else -37.0
-            top = photo_top
-            width = photo_width
-            height = photo_height if photo_height >= 200 else 233.0
-            max_bottom = 705.0
-            addr_bot = None
-            if addr is not None:
-                try:
-                    addr_bot = float(addr.Top) + float(addr.Height)
-                    if top < addr_bot + 24.0:
-                        top = addr_bot + 24.0
-                except Exception:
-                    addr_bot = None
-            if top + height > max_bottom:
-                overflow = (top + height) - max_bottom
-                min_top = (addr_bot + 24.0) if addr_bot is not None else (top - overflow)
-                top = max(top - overflow, min_top)
-                if top + height > max_bottom:
-                    height = max(200.0, max_bottom - top)
-
-            # Hide empty template frame (border made address+photo look one box)
-            try:
-                tb21.Line.Visible = 0
-                tb21.Fill.Visible = 0
-            except Exception:
-                pass
-            try:
-                # wdRelativeHorizontalPositionPage = 1
-                tb21.RelativeHorizontalPosition = 1
-                tb21.Left = -2500.0
-                tb21.Width = 1.0
-                tb21.Height = 1.0
-            except Exception:
-                try:
-                    tb21.Left = -2500.0
-                except Exception:
-                    pass
-
-            pic = doc.Shapes.AddPicture(
-                FileName=sv,
-                LinkToFile=False,
-                SaveWithDocument=True,
-                Left=left,
-                Top=top,
-                Width=width,
-                Height=height,
-            )
-            try:
-                pic.Name = "CoverStreetView"
-            except Exception:
-                pass
-            try:
-                pic.Line.Visible = 0
-            except Exception:
-                pass
-            gap = None
-            if addr is not None:
-                try:
-                    gap = float(top) - (float(addr.Top) + float(addr.Height))
-                except Exception:
-                    pass
+        if removed_dupes:
             logger.info(
-                "Cover fix: photo slot (%.1f, %.1f) h=%.1f gap_from_addr=%s",
-                left,
-                top,
-                height,
-                f"{gap:.1f}" if gap is not None else "n/a",
+                "Cover fix: removed %s duplicate CoverStreetView shape(s); "
+                "Text Box 21 left in template position",
+                removed_dupes,
             )
-        elif not sv:
-            logger.warning("Cover fix: no Street View path — cover photo not added")
+        elif tb21 is not None:
+            logger.info(
+                "Cover fix: Text Box 21 left in template position (no AddPicture)"
+            )
         else:
-            logger.warning("Cover fix: Text Box 21 not found — cover photo not added")
+            logger.warning("Cover fix: Text Box 21 not found")
 
     def _remove_blank_page_after_subject_photos(self, doc: Document) -> None:
         """Drop orphan page breaks / decorative shapes right after SUBJECT PHOTOS.
@@ -4976,6 +4958,190 @@ Rules:
                 conservative,
             )
 
+    def _merge_opinions_formula_cells(
+        self, doc: Document, property_data: "PropertyReportData"
+    ) -> None:
+        """Merge & center Market Sale Price formula cells in OPINIONS OF VALUE.
+
+        Turns separate `$/SF | X | SF` cells into one centered
+        `$52.90/SF X 87,120` cell (same for the empty rounded middle).
+        """
+        from docx.oxml import OxmlElement
+        from docx.oxml.ns import qn
+
+        tv = getattr(property_data, "table_values", None) or {}
+        psf = tv.get("{{market_price_psf}}") or ""
+        sf = tv.get("{{market_building_sf}}") or ""
+        market = tv.get("{{market_value}}") or ""
+        rounded = tv.get("{{market_value_rounded}}") or ""
+
+        def _unique(row):
+            seen = set()
+            out = []
+            for cell in row.cells:
+                if id(cell._tc) in seen:
+                    continue
+                seen.add(id(cell._tc))
+                out.append(cell)
+            return out
+
+        def _make_tc(text, span, bold=False, sz="20"):
+            tc = OxmlElement("w:tc")
+            tcPr = OxmlElement("w:tcPr")
+            tc.append(tcPr)
+            tcW = OxmlElement("w:tcW")
+            tcW.set(qn("w:w"), str(max(1, 1200 * span)))
+            tcW.set(qn("w:type"), "dxa")
+            tcPr.append(tcW)
+            if span > 1:
+                gs = OxmlElement("w:gridSpan")
+                gs.set(qn("w:val"), str(span))
+                tcPr.append(gs)
+            borders = OxmlElement("w:tcBorders")
+            tcPr.append(borders)
+            for edge in ("top", "left", "bottom", "right"):
+                el = OxmlElement(f"w:{edge}")
+                el.set(qn("w:val"), "single")
+                el.set(qn("w:sz"), "4")
+                el.set(qn("w:space"), "0")
+                el.set(qn("w:color"), "000000")
+                borders.append(el)
+            vAlign = OxmlElement("w:vAlign")
+            vAlign.set(qn("w:val"), "center")
+            tcPr.append(vAlign)
+            p = OxmlElement("w:p")
+            tc.append(p)
+            pPr = OxmlElement("w:pPr")
+            p.append(pPr)
+            jc = OxmlElement("w:jc")
+            jc.set(qn("w:val"), "center")
+            pPr.append(jc)
+            r = OxmlElement("w:r")
+            p.append(r)
+            rPr = OxmlElement("w:rPr")
+            r.append(rPr)
+            if bold:
+                rPr.append(OxmlElement("w:b"))
+            for tag in ("sz", "szCs"):
+                el = OxmlElement(f"w:{tag}")
+                el.set(qn("w:val"), sz)
+                rPr.append(el)
+            t = OxmlElement("w:t")
+            t.text = text
+            t.set(qn("xml:space"), "preserve")
+            r.append(t)
+            return tc
+
+        def _make_tr(cells, height="288"):
+            tr = OxmlElement("w:tr")
+            trPr = OxmlElement("w:trPr")
+            tr.append(trPr)
+            h = OxmlElement("w:trHeight")
+            h.set(qn("w:val"), height)
+            h.set(qn("w:hRule"), "atLeast")
+            trPr.append(h)
+            for c in cells:
+                tr.append(c)
+            return tr
+
+        def _font_sz_from_row(row) -> str:
+            for cell in _unique(row):
+                for p in cell.paragraphs:
+                    pPr = p._p.find(qn("w:pPr"))
+                    if pPr is not None:
+                        rPr = pPr.find(qn("w:rPr"))
+                        if rPr is not None:
+                            s = rPr.find(qn("w:sz"))
+                            if s is not None and s.get(qn("w:val")):
+                                return s.get(qn("w:val"))
+                    for run in p.runs:
+                        rPr = run._r.find(qn("w:rPr"))
+                        if rPr is None:
+                            continue
+                        s = rPr.find(qn("w:sz"))
+                        if s is not None and s.get(qn("w:val")):
+                            return s.get(qn("w:val"))
+            return "20"
+
+        touched = 0
+        for table in doc.tables:
+            flat = " ".join(
+                (c.text or "") for row in table.rows for c in row.cells
+            ).upper()
+            if "OPINIONS OF VALUE" not in flat or "MARKET SALE PRICE" not in flat:
+                continue
+
+            # Already merged if price row has exactly 3 unique cells
+            if len(table.rows) < 3:
+                continue
+            price_cells = _unique(table.rows[1])
+            already = len(price_cells) == 3 and "X" not in [
+                (c.text or "").strip().upper() for c in price_cells
+            ]
+            # Still rewrite when split, or when formula placeholder pieces remain
+            needs_merge = (not already) or any(
+                "X" == (c.text or "").strip().upper() for c in price_cells
+            )
+            if not needs_merge:
+                # Ensure middle formula cell is centered even when already merged
+                if len(price_cells) >= 2:
+                    for p in price_cells[1].paragraphs:
+                        p.alignment = 1  # WD_ALIGN_PARAGRAPH.CENTER
+                continue
+
+            grid = table._tbl.find(qn("w:tblGrid"))
+            n_cols = len(grid.findall(qn("w:gridCol"))) if grid is not None else 5
+            if n_cols >= 8:
+                label_span, mid_span, val_span = 2, 4, 2
+            else:
+                label_span, mid_span, val_span = 1, max(1, n_cols - 2), 1
+
+            sz = _font_sz_from_row(table.rows[1])
+            formula = ""
+            if psf and sf:
+                formula = f"{psf}/SF X {sf}"
+            else:
+                # Fall back to whatever text is already in the split cells
+                bits = []
+                for c in price_cells[1:-1]:
+                    bit = (c.text or "").strip()
+                    if bit:
+                        bits.append(bit)
+                formula = " ".join(bits)
+
+            value_text = market
+            if not value_text and price_cells:
+                value_text = (price_cells[-1].text or "").strip()
+            rounded_text = rounded
+            if not rounded_text and len(table.rows) > 2:
+                rounded_cells = _unique(table.rows[2])
+                if rounded_cells:
+                    rounded_text = (rounded_cells[-1].text or "").strip()
+
+            price_tr = _make_tr([
+                _make_tc("Market Sale Price", label_span, bold=True, sz=sz),
+                _make_tc(formula, mid_span, sz=sz),
+                _make_tc(value_text, val_span, sz=sz),
+            ])
+            rounded_tr = _make_tr([
+                _make_tc("Market Sales Price (Rounded)", label_span, bold=True, sz=sz),
+                _make_tc("", mid_span, sz=sz),
+                _make_tc(rounded_text, val_span, sz=sz),
+            ])
+
+            tbl = table._tbl
+            trs = list(tbl.findall(qn("w:tr")))
+            if len(trs) > 2:
+                trs[1].getparent().replace(trs[1], price_tr)
+                trs[2].getparent().replace(trs[2], rounded_tr)
+                touched += 1
+
+        if touched:
+            logger.info(
+                "Merged & centered OPINIONS OF VALUE formula cells in %s table(s)",
+                touched,
+            )
+
     def _align_valuation_and_opinions_table_widths(self, doc: Document) -> None:
         """Make OPINIONS OF VALUE match VALUATION METHOD table width/right edge.
 
@@ -5132,6 +5298,139 @@ Rules:
 
         if touched:
             logger.info("Applied grid borders to %s sales-conclusion table(s)", touched)
+
+    def _sync_sale_opinion_typography(self, doc: Document) -> None:
+        """Match SALE OPINION OF VALUE font size and row height to OPINIONS rows.
+
+        Rebuilds used to leave Aggressive/Market/Conservative at 9pt while the
+        Market Sale Price rows above stayed at 10pt (VALUATION METHOD size).
+        """
+        from docx.oxml import OxmlElement
+        from docx.oxml.ns import qn
+
+        def _unique(row):
+            seen = set()
+            out = []
+            for cell in row.cells:
+                if id(cell._tc) in seen:
+                    continue
+                seen.add(id(cell._tc))
+                out.append(cell)
+            return out
+
+        def _read_sz(cell):
+            for p in cell.paragraphs:
+                pPr = p._p.find(qn("w:pPr"))
+                if pPr is not None:
+                    rPr = pPr.find(qn("w:rPr"))
+                    if rPr is not None:
+                        s = rPr.find(qn("w:sz"))
+                        if s is not None and s.get(qn("w:val")):
+                            return s.get(qn("w:val"))
+                for run in p.runs:
+                    rPr = run._r.find(qn("w:rPr"))
+                    if rPr is None:
+                        continue
+                    s = rPr.find(qn("w:sz"))
+                    if s is not None and s.get(qn("w:val")):
+                        return s.get(qn("w:val"))
+            return None
+
+        def _read_row_height(row):
+            trPr = row._tr.find(qn("w:trPr"))
+            if trPr is None:
+                return None
+            th = trPr.find(qn("w:trHeight"))
+            if th is None:
+                return None
+            return th.get(qn("w:val"))
+
+        def _ensure_sz(rPr, sz: str) -> None:
+            for tag in ("sz", "szCs"):
+                el = rPr.find(qn(f"w:{tag}"))
+                if el is None:
+                    el = OxmlElement(f"w:{tag}")
+                    rPr.append(el)
+                el.set(qn("w:val"), sz)
+
+        def _apply_sz(cell, sz: str) -> None:
+            for p in cell.paragraphs:
+                pPr = p._p.get_or_add_pPr()
+                rPr = pPr.find(qn("w:rPr"))
+                if rPr is None:
+                    rPr = OxmlElement("w:rPr")
+                    pPr.append(rPr)
+                _ensure_sz(rPr, sz)
+                if not p.runs:
+                    p.add_run(p.text or "")
+                for run in p.runs:
+                    _ensure_sz(run._r.get_or_add_rPr(), sz)
+
+        def _apply_row_height(row, height: str) -> None:
+            trPr = row._tr.get_or_add_trPr()
+            th = trPr.find(qn("w:trHeight"))
+            if th is None:
+                th = OxmlElement("w:trHeight")
+                trPr.append(th)
+            th.set(qn("w:val"), height)
+            th.set(qn("w:hRule"), "atLeast")
+
+        # Prefer VALUATION METHOD size when present; else OPINIONS price row; else 20.
+        ref_sz = "20"
+        ref_h = "288"
+        for table in doc.tables:
+            flat = " ".join(
+                (c.text or "") for row in table.rows for c in row.cells
+            ).upper()
+            if "VALUATION METHOD" in flat and "VALUE ESTIMATE" in flat:
+                if table.rows:
+                    for cell in _unique(table.rows[0]):
+                        got = _read_sz(cell)
+                        if got:
+                            ref_sz = got
+                            break
+                    h = _read_row_height(table.rows[0])
+                    if h:
+                        ref_h = h
+                break
+
+        touched = 0
+        for table in doc.tables:
+            flat = " ".join(
+                (c.text or "") for row in table.rows for c in row.cells
+            ).upper()
+            if "OPINIONS OF VALUE" not in flat and "SALE OPINION OF VALUE" not in flat:
+                continue
+
+            # If this table has Market Sale Price, prefer that row's live size
+            local_sz = ref_sz
+            local_h = ref_h
+            for row in table.rows:
+                texts = [(c.text or "").strip().upper() for c in _unique(row)]
+                if texts and texts[0].startswith("MARKET SALE PRICE"):
+                    for cell in _unique(row):
+                        got = _read_sz(cell)
+                        if got:
+                            local_sz = got
+                            break
+                    h = _read_row_height(row)
+                    if h:
+                        local_h = h
+                    break
+
+            for row in table.rows:
+                _apply_row_height(row, local_h)
+                for cell in _unique(row):
+                    _apply_sz(cell, local_sz)
+                    touched += 1
+
+        if touched:
+            logger.info(
+                "Synced OPINIONS/SALE OPINION typography to sz=%s height=%s (%s cells)",
+                ref_sz,
+                ref_h,
+                touched,
+            )
 
     def _center_sale_opinion_cells(self, doc: Document) -> None:
         """Center Aggressive / Market Value / Conservative labels and amounts."""
@@ -5341,7 +5640,9 @@ Rules:
                 continue
 
             # Title bar: flush left, one-sided round on the right (like the mock)
-            if "Broker Opinion of Value" in texts and name.startswith("Rectangle"):
+            if "Broker Opinion of Value" in texts and (
+                name.startswith("Rectangle") or "Broker Opinion" in texts
+            ):
                 self._cover_force_left_align(drawing)
                 for geom in drawing.iter(qn("a:prstGeom")):
                     geom.set("prst", "round1Rect")
@@ -5359,9 +5660,25 @@ Rules:
                     if rPr is None:
                         rPr = etree.Element(w_rpr)
                         run.insert(0, rPr)
+                    # Clear theme color attrs that can force black over w:val
+                    for attr in (
+                        qn("w:themeColor"),
+                        qn("w:themeTint"),
+                        qn("w:themeShade"),
+                    ):
+                        if attr in rPr.attrib:
+                            del rPr.attrib[attr]
                     color = rPr.find(w_color)
                     if color is None:
                         color = etree.SubElement(rPr, w_color)
+                    else:
+                        for attr in (
+                            qn("w:themeColor"),
+                            qn("w:themeTint"),
+                            qn("w:themeShade"),
+                        ):
+                            if attr in color.attrib:
+                                del color.attrib[attr]
                     color.set(qn("w:val"), "FFFFFF")
                     title_whitened += 1
                 continue
@@ -5383,38 +5700,29 @@ Rules:
                     break
                 continue
 
-            # Address in the bottom-left white diagonal corner
+            # Address textbox — leave Text Box 26 at its TEMPLATE slot (~294pt,
+            # above Street View). Do not shove it onto the photo.
             if "{{address}}" in texts and "PREPARED" not in texts.upper():
-                self._cover_place_address_in_corner(drawing)
+                self._cover_keep_address_template_slot(drawing)
                 addr_placed += 1
                 continue
 
-            # Capture PREPARED BY top so the cover photo can align with it
+            # Capture PREPARED BY (used by other cover polish; do not move photo)
             if texts.upper().startswith("PREPARED BY"):
                 continue
 
-            # Cover Street View — top edge level with PREPARED BY title
+            # Cover Street View (Text Box 21 / {{main_img}}) — leave template
+            # position alone. Moving it caused the Client long-form cover photo
+            # to jump up into the hero header.
             if name == "Text Box 21" or "{{main_img}}" in (
                 (docPr.get("descr") or "")
             ):
-                if name == "Text Box 21":
-                    # Match PREPARED BY title top (fallback ~5.19" / 374pt)
-                    top_emu = prep_by_top_emu or str(int(5.187 * 914400))
-                    posV = next(drawing.iter(qn("wp:positionV")), None)
-                    if posV is not None:
-                        for child in list(posV):
-                            if etree.QName(child).localname in ("posOffset", "align"):
-                                posV.remove(child)
-                        posV.set("relativeFrom", "page")
-                        off = etree.SubElement(posV, qn("wp:posOffset"))
-                        off.text = top_emu
                 anchor = next(
                     (a for a in drawing if etree.QName(a).localname == "anchor"),
                     None,
                 )
                 if anchor is not None:
                     anchor.set("behindDoc", "0")
-                    anchor.set("relativeHeight", "251670000")
                 continue
 
         corner_ok = self._ensure_cover_diagonal_corner(doc)
@@ -5449,14 +5757,20 @@ Rules:
         if posH.get("relativeFrom") is None:
             posH.set("relativeFrom", "page")
 
-    def _cover_place_address_in_corner(self, drawing) -> None:
-        """Sit address in the white diagonal corner (bottom-left), flush left."""
+    def _cover_keep_address_template_slot(self, drawing) -> None:
+        """Place cover address above the Street View, left-aligned with it.
+
+        Text Box 26 shipped at -64pt (hangs past the photo). Text Box 21 (cover
+        Street View) is at -32.6pt. Match that left edge so the address sits in
+        the same horizontal band as the short-template photo — not farther left.
+        """
         from lxml import etree
         from docx.oxml.ns import qn
 
-        # Address flush-left in white diagonal corner (~365pt)
-        left_emu = str(int(-10 / 72 * 914400))  # ~-0.14" — more left
-        top_emu = str(int(365 / 72 * 914400))
+        # Align with Text Box 21 (cover Street View): H -32.63pt column
+        # Keep designed vertical slot above the photo: V 294.15pt paragraph
+        left_emu = str(int(round(-32.63 / 72 * 914400)))
+        top_emu = str(int(round(294.15 / 72 * 914400)))
 
         posH = next(drawing.iter(qn("wp:positionH")), None)
         posV = next(drawing.iter(qn("wp:positionV")), None)
@@ -5464,25 +5778,29 @@ Rules:
             for child in list(posH):
                 if etree.QName(child).localname in ("posOffset", "align"):
                     posH.remove(child)
-            posH.set("relativeFrom", "page")
+            posH.set("relativeFrom", "column")
             off = etree.SubElement(posH, qn("wp:posOffset"))
             off.text = left_emu
         if posV is not None:
             for child in list(posV):
                 if etree.QName(child).localname in ("posOffset", "align"):
                     posV.remove(child)
-            posV.set("relativeFrom", "page")
+            posV.set("relativeFrom", "paragraph")
             off = etree.SubElement(posV, qn("wp:posOffset"))
             off.text = top_emu
 
-        # Keep address textbox above the white corner shape
+        # Keep address above the photo in z-order
         anchor = next(
             (a for a in drawing if etree.QName(a).localname == "anchor"),
             None,
         )
         if anchor is not None:
             anchor.set("behindDoc", "0")
-            anchor.set("relativeHeight", "251660000")
+            anchor.set("relativeHeight", "251680000")
+
+    def _cover_place_address_in_corner(self, drawing, photo_top_emu=None) -> None:
+        """Deprecated alias — restore address above / aligned with cover photo."""
+        self._cover_keep_address_template_slot(drawing)
 
     def _ensure_cover_diagonal_corner(self, doc: Document) -> bool:
         """Force the bottom-left white diagonal corner (Group 13) to be visible.

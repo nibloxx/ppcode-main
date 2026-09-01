@@ -160,13 +160,12 @@ TABLE_MAP = {
     (3, 1, 2): "{{reconciliation_notes}}",
     (3, 2, 1): "{{market_value_rounded}}",
     (3, 2, 2): "{{reconciliation_notes}}",
-    (4, 1, 2): "{{market_price_psf}}/SF",
-    (4, 1, 4): "{{market_building_sf}}",
-    (4, 1, 6): "{{market_value}}",
-    (4, 2, 6): "{{market_value_rounded}}",
+    (4, 1, 1): "{{market_price_psf}}/SF X {{market_building_sf}}",
+    (4, 1, 2): "{{market_value}}",
+    (4, 2, 2): "{{market_value_rounded}}",
     (4, 5, 0): "{{value_aggressive}}",
-    (4, 5, 3): "{{market_value_rounded}}",
-    (4, 5, 4): "{{value_conservative}}",
+    (4, 5, 1): "{{market_value_rounded}}",
+    (4, 5, 2): "{{value_conservative}}",
 }
 
 # Labels kept from short-form design; order matches body sections so live
@@ -652,14 +651,14 @@ def compress_embedded_images(doc, max_edge: int = 1200, quality: int = 70) -> in
 
 
 def rebuild_sale_opinion_block(doc: Document) -> int:
-    """Normalize SALE OPINION OF VALUE to Aggressive | Market Value | Conservative.
+    """Normalize OPINIONS / SALE OPINION blocks.
 
-    The short-form source has scrambled merges that put Market under Aggressive.
-    Rebuild those three rows as a clean labeled grid with rounded placeholders.
+    - Merge & center Market Sale Price formula ($/SF X SF) into one cell
+    - Keep Aggressive | Market Value | Conservative as a clean 3-col grid
     """
     from lxml import etree
 
-    def make_tc(text, span, fill=None, bold=False, color=None):
+    def make_tc(text, span, fill=None, bold=False, color=None, sz="20"):
         tc = etree.Element(qn("w:tc"))
         tcPr = etree.SubElement(tc, qn("w:tcPr"))
         etree.SubElement(tcPr, qn("w:tcW"), {
@@ -686,23 +685,28 @@ def rebuild_sale_opinion_block(doc: Document) -> int:
         p = etree.SubElement(tc, qn("w:p"))
         pPr = etree.SubElement(p, qn("w:pPr"))
         etree.SubElement(pPr, qn("w:jc"), {qn("w:val"): "center"})
+        # Match VALUATION METHOD / SUMMARY tables (10pt)
+        rPr_p = etree.SubElement(pPr, qn("w:rPr"))
+        etree.SubElement(rPr_p, qn("w:sz"), {qn("w:val"): sz})
+        etree.SubElement(rPr_p, qn("w:szCs"), {qn("w:val"): sz})
         r = etree.SubElement(p, qn("w:r"))
         rPr = etree.SubElement(r, qn("w:rPr"))
         if bold:
             etree.SubElement(rPr, qn("w:b"))
         if color:
             etree.SubElement(rPr, qn("w:color"), {qn("w:val"): color})
-        etree.SubElement(rPr, qn("w:sz"), {qn("w:val"): "18"})
+        etree.SubElement(rPr, qn("w:sz"), {qn("w:val"): sz})
+        etree.SubElement(rPr, qn("w:szCs"), {qn("w:val"): sz})
         t = etree.SubElement(r, qn("w:t"))
         t.text = text
         t.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
         return tc
 
-    def make_tr(cells):
+    def make_tr(cells, height="288"):
         tr = etree.Element(qn("w:tr"))
         trPr = etree.SubElement(tr, qn("w:trPr"))
         etree.SubElement(trPr, qn("w:trHeight"), {
-            qn("w:val"): "200",
+            qn("w:val"): height,
             qn("w:hRule"): "atLeast",
         })
         for c in cells:
@@ -712,9 +716,7 @@ def rebuild_sale_opinion_block(doc: Document) -> int:
     fixed = 0
     for table in doc.tables:
         flat = " ".join(c.text for r in table.rows for c in r.cells).upper()
-        if "OPINIONS OF VALUE" not in flat or "SALE OPINION OF VALUE" not in flat:
-            continue
-        if len(table.rows) < 6:
+        if "OPINIONS OF VALUE" not in flat or "MARKET SALE PRICE" not in flat:
             continue
 
         fill = "0070C0"
@@ -726,27 +728,61 @@ def rebuild_sale_opinion_block(doc: Document) -> int:
                     fill = s.get(qn("w:fill"))
                     break
 
-        header = make_tr([
-            make_tc("SALE OPINION OF VALUE", 8, fill=fill, bold=True, color="FFFFFF")
+        # Prospect short-form uses an 8-col grid; Client opinions is 5-col.
+        grid = table._tbl.find(qn("w:tblGrid"))
+        n_cols = len(grid.findall(qn("w:gridCol"))) if grid is not None else 8
+        if n_cols >= 8:
+            label_span, mid_span, val_span = 2, 4, 2
+            agg_span, mkt_span, con_span = 3, 3, 2
+            total_span = 8
+        else:
+            label_span, mid_span, val_span = 1, 3, 1
+            agg_span, mkt_span, con_span = 1, 1, 1
+            total_span = n_cols
+
+        price_row = make_tr([
+            make_tc("Market Sale Price", label_span, bold=True),
+            make_tc("{{market_price_psf}}/SF X {{market_building_sf}}", mid_span),
+            make_tc("{{market_value}}", val_span),
         ])
-        labels = make_tr([
-            make_tc("Aggressive", 3, bold=True),
-            make_tc("Market Value", 3, bold=True),
-            make_tc("Conservative", 2, bold=True),
-        ])
-        values = make_tr([
-            make_tc("{{value_aggressive}}", 3),
-            make_tc("{{market_value_rounded}}", 3),
-            make_tc("{{value_conservative}}", 2),
+        rounded_row = make_tr([
+            make_tc("Market Sales Price (Rounded)", label_span, bold=True),
+            make_tc("", mid_span),
+            make_tc("{{market_value_rounded}}", val_span),
         ])
 
         tbl = table._tbl
         trs = list(tbl.findall(qn("w:tr")))
-        for idx, new_tr in ((3, header), (4, labels), (5, values)):
-            if idx >= len(trs):
-                break
-            old = trs[idx]
-            old.getparent().replace(old, new_tr)
+        for idx, new_tr in ((1, price_row), (2, rounded_row)):
+            if idx < len(trs):
+                trs[idx].getparent().replace(trs[idx], new_tr)
+
+        # SALE OPINION block only on Prospect (6+ rows)
+        if len(table.rows) >= 6 and "SALE OPINION OF VALUE" in flat:
+            trs = list(tbl.findall(qn("w:tr")))
+            header = make_tr([
+                make_tc(
+                    "SALE OPINION OF VALUE",
+                    total_span,
+                    fill=fill,
+                    bold=True,
+                    color="FFFFFF",
+                )
+            ])
+            labels = make_tr([
+                make_tc("Aggressive", agg_span, bold=True),
+                make_tc("Market Value", mkt_span, bold=True),
+                make_tc("Conservative", con_span, bold=True),
+            ])
+            values = make_tr([
+                make_tc("{{value_aggressive}}", agg_span),
+                make_tc("{{market_value_rounded}}", mkt_span),
+                make_tc("{{value_conservative}}", con_span),
+            ])
+            for idx, new_tr in ((3, header), (4, labels), (5, values)):
+                if idx < len(trs):
+                    trs[idx].getparent().replace(trs[idx], new_tr)
+
         fixed += 1
     return fixed
 
