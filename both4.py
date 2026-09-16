@@ -3520,8 +3520,7 @@ Rules:
         }
 
         # Cover polish BEFORE placeholder replacement so {{address}} is still findable.
-        # Theme tint on hero, left-flush bars, address in white diagonal corner.
-        self._polish_cover_layout(doc, color_theme=color_theme)
+        self._polish_cover_layout(doc, color_theme=color_theme, property_data=property_data)
 
         # Prefer a two-line cover address like the mock (street / city-state-zip)
         if property_data.table_values:
@@ -3550,8 +3549,7 @@ Rules:
             self._style_regional_analysis(doc)
 
         # Cover / aerial / subject images live in text boxes (alt-text placeholders).
-        # Keep the template's designed diagonal cover hero (Picture 8) — only tint it.
-        # Bottom-left {{main_img}} is Street View only — never aerial.
+        # Picture 8 is the designed header. Bottom-left {{main_img}} stays Street View.
         cover_photo = property_data.street_view_image_path
         aerial_photo = property_data.aerial_image_path
         # Guard: never let a shared/mis-assigned path put the aerial onto the cover
@@ -3663,11 +3661,16 @@ Rules:
         # Apply color theme to the report accent (post-process the saved file)
         if color_theme:
             self._apply_color_theme(output_path, color_theme)
-            # Theme zip rewrite must not leave the title black — re-assert white.
             try:
                 self._fix_cover_after_word_com(output_path, cover_photo)
             except Exception as exc:
                 logger.warning("Post-theme cover title whiten failed: %s", exc)
+
+        # Word COM can restore the old header photo. Stamp the designed hero last.
+        try:
+            self._stamp_cover_hero_file(output_path, color_theme, property_data)
+        except Exception as exc:
+            logger.warning("Cover header stamp failed: %s", exc)
 
         return str(output_path)
 
@@ -3730,12 +3733,7 @@ Rules:
                 xml = xml2
                 logger.info("Cover repair: forced white fill on %s", shape_id)
 
-        xml = re.sub(
-            r'(<(?:v:)?group\b[^>]*\bid="Group 13"[^>]*)\sfilled="f"',
-            r'\1 filled="t" fillcolor="#ffffff"',
-            xml,
-            count=1,
-        )
+        # Group 13 is hidden: the white chevron is baked into the designed hero JPEG.
 
         # --- 2) White title text on "Broker Opinion of Value" ---
         # COM often leaves black / theme text; force FFFFFF on every matching run.
@@ -4527,11 +4525,52 @@ Rules:
         addr = None
         for i in range(1, int(doc.Shapes.Count) + 1):
             shape = doc.Shapes(i)
-            name = shape.Name or ""
-            if name == "Group 13":
-                group = shape
+            name = (shape.Name or "").strip()
+            text = ""
+            try:
+                if shape.TextFrame.HasText:
+                    text = (shape.TextFrame.TextRange.Text or "").replace("\r", " ").strip()
+            except Exception:
+                pass
+            hide = name in ("Rectangle 28", "Text Box 30", "Group 13") or (
+                "Broker Opinion of Value" in text
+            ) or (text.startswith("Date:") and name.startswith("Text Box"))
+            if hide:
+                try:
+                    shape.Visible = False
+                except Exception:
+                    pass
+                continue
+            if name == "Picture 8":
+                try:
+                    shape.LockAspectRatio = 0
+                    shape.Width = self.COVER_HERO_WIDTH_PT
+                    shape.Height = self.COVER_HERO_HEIGHT_PT
+                    shape.Fill.Visible = False
+                except Exception as exc:
+                    logger.warning("Cover fix: could not size Picture 8: %s", exc)
             elif name == "Text Box 21":
                 tb21 = shape
+                try:
+                    shape.RelativeHorizontalPosition = 2  # column
+                    shape.Left = self.COVER_PHOTO_LEFT_PT
+                    shape.RelativeVerticalPosition = 2  # paragraph
+                    shape.Top = self.COVER_PHOTO_TOP_PT
+                    shape.ZOrder(0)
+                except Exception as exc:
+                    logger.warning("Cover fix: could not pin Street View: %s", exc)
+            elif name.startswith("Text Box") and text.startswith("PREPARED BY"):
+                try:
+                    shape.RelativeVerticalPosition = 2
+                    shape.Top = self.COVER_BY_TOP_PT
+                except Exception:
+                    pass
+            elif name.startswith("Text Box") and text.startswith("PREPARED FOR"):
+                try:
+                    shape.RelativeVerticalPosition = 2
+                    shape.Top = self.COVER_FOR_TOP_PT
+                except Exception:
+                    pass
             elif name == "Text Box 26":
                 try:
                     if not shape.TextFrame.HasText:
@@ -4606,10 +4645,7 @@ Rules:
         except Exception as exc:
             logger.warning("Cover fix: could not whiten title text: %s", exc)
 
-        # Desired cover: keep Text Box 21 in its TEMPLATE slot. Only remove
-        # duplicate Street Views that AddPicture used to stack on top of it.
-        # Do NOT move the photo to PREPARED BY / re-place it — that shifted the
-        # Client (20-25 page) cover image up into the hero header.
+        # 2-column body: street photo left, PREPARED BY/FOR right, same top.
         if tb21 is not None:
             try:
                 tb21.Line.Visible = 0
@@ -4662,17 +4698,11 @@ Rules:
                 # not the old -64pt hang that sat too far left vs the short template.
                 try:
                     # wdRelativeHorizontalPositionColumn = 2
-                    # wdRelativeVerticalPositionParagraph = 3
+                    # wdRelativeVerticalPositionParagraph = 2
                     addr.RelativeHorizontalPosition = 2
-                    addr.RelativeVerticalPosition = 3
-                    photo_left = -32.63
-                    if tb21 is not None:
-                        try:
-                            photo_left = float(tb21.Left)
-                        except Exception:
-                            pass
-                    addr.Left = photo_left
-                    addr.Top = 294.1
+                    addr.RelativeVerticalPosition = 2
+                    addr.Left = self.COVER_ADDR_LEFT_PT
+                    addr.Top = self.COVER_ADDR_TOP_PT
                     addr.Width = 312.6
                     addr.Height = 68.4
                 except Exception:
@@ -4682,7 +4712,7 @@ Rules:
                 except Exception:
                     pass
                 logger.info(
-                    "Cover fix: address aligned to photo left L=%.1f T=%.1f",
+                    "Cover fix: address above photo L=%.1f T=%.1f",
                     float(addr.Left),
                     float(addr.Top),
                 )
@@ -4697,7 +4727,8 @@ Rules:
             )
         elif tb21 is not None:
             logger.info(
-                "Cover fix: Text Box 21 left in template position (no AddPicture)"
+                "Cover fix: Street View pinned beside PREPARED BY (T=%.1f)",
+                self.COVER_PHOTO_TOP_PT,
             )
         else:
             logger.warning("Cover fix: Text Box 21 not found")
@@ -5553,16 +5584,59 @@ Rules:
     COLOR_THEME_ALIASES = {
         "blue": "light blue",
         "lightblue": "light blue",
+        "light blue": "light blue",
         "darkblue": "dark blue",
+        "dark blue": "dark blue",
+        "0070c0": "light blue",
+        "00b0f0": "light blue",
+        "0066cc": "light blue",
+        "1f3864": "dark blue",
+        "2e5496": "dark blue",
+        "c00000": "red",
+        "e31c23": "red",
+        "2e7d32": "green",
+        "5bb85c": "green",
     }
     TEMPLATE_ACCENTS = ("0070C0", "00B0F0")
     TEMPLATE_HEADER_FOOTER_ACCENT = "0066CC"
 
+    COVER_HERO_WIDTH_PT = 611.95
+    COVER_HERO_HEIGHT_PT = 360.0
+    COVER_HERO_PX = (1836, 1080)
+    COVER_ADDR_LEFT_PT = -32.63
+    COVER_ADDR_TOP_PT = 294.15
+    COVER_PHOTO_LEFT_PT = -32.63
+    COVER_PHOTO_TOP_PT = 373.47
+    COVER_BY_TOP_PT = 373.47
+    COVER_FOR_TOP_PT = 481.07
+
     def _normalize_color_theme(self, color_theme: Optional[str]) -> str:
-        """Map UI values like light-blue / darkblue -> canonical theme keys."""
-        theme = (color_theme or "").strip().lower().replace("-", " ").replace("_", " ")
-        theme = " ".join(theme.split())
+        """Map UI values like light-blue / darkblue / #0070C0 -> canonical keys."""
+        if isinstance(color_theme, dict):
+            color_theme = (
+                color_theme.get("name")
+                or color_theme.get("value")
+                or color_theme.get("hex")
+                or color_theme.get("color")
+                or ""
+            )
+        theme = str(color_theme or "").strip().lower().replace("-", " ").replace("_", " ")
+        theme = " ".join(theme.split()).lstrip("#")
+        compact = theme.replace(" ", "")
+        if compact in self.COLOR_THEME_ALIASES:
+            return self.COLOR_THEME_ALIASES[compact]
         return self.COLOR_THEME_ALIASES.get(theme, theme)
+
+    def _theme_primary_hex(self, color_theme: Optional[str]) -> str:
+        """Primary hex for the cover hero panel (selected theme, else light blue)."""
+        theme = self._normalize_color_theme(color_theme)
+        target = self.COLOR_THEMES.get(theme)
+        if target:
+            return target[0]
+        raw = str(color_theme or "").strip().lstrip("#")
+        if len(raw) == 6 and all(c in "0123456789abcdefABCDEF" for c in raw):
+            return raw.upper()
+        return self.COLOR_THEMES["light blue"][0]
 
     @staticmethod
     def _format_cover_address(address: Optional[str]) -> str:
@@ -5584,43 +5658,26 @@ Rules:
             return f"{' '.join(tokens[:-3])} {tokens[-3]},\n{tokens[-2]} {tokens[-1]}"
         return text
 
-    def _polish_cover_layout(self, doc: Document, color_theme: Optional[str] = None) -> None:
-        """Match the designed cover: tinted hero, left-flush bars, address in corner.
+    def _polish_cover_layout(
+        self,
+        doc: Document,
+        color_theme: Optional[str] = None,
+        property_data=None,
+    ) -> None:
+        """Designed cover hero in Picture 8 only.
 
-        - Keep Picture 8 (diagonal hero) but apply a theme color shade/tint
-        - Title + date bars flush to the left (one-sided round on the right)
-        - White title text; address nestled in the bottom-left white diagonal corner
+        Bottom block (address, Street View, PREPARED BY/FOR) is not moved.
+        Old title/date bars and Group 13 are hidden so they cannot cover it.
         """
-        from lxml import etree
         from docx.oxml.ns import qn
 
-        a_av = "{http://schemas.openxmlformats.org/drawingml/2006/main}avLst"
-        a_gd = "{http://schemas.openxmlformats.org/drawingml/2006/main}gd"
-        w_rpr = qn("w:rPr")
-        w_color = qn("w:color")
-
         theme = self._normalize_color_theme(color_theme)
-        target = self.COLOR_THEMES.get(theme) or self.COLOR_THEMES["light blue"]
-        primary, secondary = target
+        primary = self._theme_primary_hex(color_theme)
+        logger.info("Cover hero theme=%r primary=%s", theme, primary)
 
-        title_shaped = date_shaped = title_whitened = addr_placed = 0
-        prep_by_top_emu = None
-
-        # Pass 1: locate PREPARED BY top (photo must match this — order in XML varies)
-        for drawing in doc.element.body.iter(qn("w:drawing")):
-            texts = " ".join(
-                (t.text or "") for t in drawing.iter(qn("w:t")) if t.text
-            ).strip()
-            if not texts.upper().startswith("PREPARED BY"):
-                continue
-            posV = next(drawing.iter(qn("wp:positionV")), None)
-            if posV is None:
-                continue
-            off = posV.find(qn("wp:posOffset"))
-            if off is not None and off.text:
-                prep_by_top_emu = off.text
-                break
-
+        hidden = 0
+        pinned = 0
+        to_hide = []
         for drawing in doc.element.body.iter(qn("w:drawing")):
             docPr = next(drawing.iter(qn("wp:docPr")), None)
             if docPr is None:
@@ -5629,115 +5686,162 @@ Rules:
             texts = " ".join(
                 (t.text or "") for t in drawing.iter(qn("w:t")) if t.text
             ).strip()
-
-            # Skip off-canvas leftovers (ox far negative, no left-align)
-            posH = next(drawing.iter(qn("wp:positionH")), None)
-            ox_el = posH.find(qn("wp:posOffset")) if posH is not None else None
-            align_el = posH.find(qn("wp:align")) if posH is not None else None
-            ox = int(ox_el.text) if ox_el is not None and ox_el.text else None
-            is_left_aligned = align_el is not None and (align_el.text or "") == "left"
-            if ox is not None and ox < -5_000_000 and not is_left_aligned:
-                continue
-
-            # Title bar: flush left, one-sided round on the right (like the mock)
-            if "Broker Opinion of Value" in texts and (
-                name.startswith("Rectangle") or "Broker Opinion" in texts
+            if name in ("Group 13", "Rectangle 28") or (
+                "Broker Opinion of Value" in texts and name.startswith("Rectangle")
+            ) or name == "Text Box 30" or (
+                name.startswith("Text Box") and texts.startswith("Date:")
             ):
-                self._cover_force_left_align(drawing)
-                for geom in drawing.iter(qn("a:prstGeom")):
-                    geom.set("prst", "round1Rect")
-                    av = geom.find(a_av)
-                    if av is None:
-                        av = etree.SubElement(geom, a_av)
-                    else:
-                        av.clear()
-                    gd = etree.SubElement(av, a_gd)
-                    gd.set("name", "adj")
-                    gd.set("fmla", "val 50000")
-                    title_shaped += 1
-                for run in drawing.iter(qn("w:r")):
-                    rPr = run.find(w_rpr)
-                    if rPr is None:
-                        rPr = etree.Element(w_rpr)
-                        run.insert(0, rPr)
-                    # Clear theme color attrs that can force black over w:val
-                    for attr in (
-                        qn("w:themeColor"),
-                        qn("w:themeTint"),
-                        qn("w:themeShade"),
-                    ):
-                        if attr in rPr.attrib:
-                            del rPr.attrib[attr]
-                    color = rPr.find(w_color)
-                    if color is None:
-                        color = etree.SubElement(rPr, w_color)
-                    else:
-                        for attr in (
-                            qn("w:themeColor"),
-                            qn("w:themeTint"),
-                            qn("w:themeShade"),
-                        ):
-                            if attr in color.attrib:
-                                del color.attrib[attr]
-                    color.set(qn("w:val"), "FFFFFF")
-                    title_whitened += 1
+                to_hide.append(drawing)
+                hidden += 1
                 continue
-
-            # Date / property-name pill — flush left under the title
-            if name.startswith("Text Box") and texts.startswith("Date:"):
-                self._cover_force_left_align(drawing)
-                for geom in drawing.iter(qn("a:prstGeom")):
-                    geom.set("prst", "round1Rect")
-                    av = geom.find(a_av)
-                    if av is None:
-                        av = etree.SubElement(geom, a_av)
-                    else:
-                        av.clear()
-                    gd = etree.SubElement(av, a_gd)
-                    gd.set("name", "adj")
-                    gd.set("fmla", "val 35000")
-                    date_shaped += 1
-                    break
-                continue
-
-            # Address textbox — leave Text Box 26 at its TEMPLATE slot (~294pt,
-            # above Street View). Do not shove it onto the photo.
-            if "{{address}}" in texts and "PREPARED" not in texts.upper():
-                self._cover_keep_address_template_slot(drawing)
-                addr_placed += 1
-                continue
-
-            # Capture PREPARED BY (used by other cover polish; do not move photo)
-            if texts.upper().startswith("PREPARED BY"):
-                continue
-
-            # Cover Street View (Text Box 21 / {{main_img}}) — leave template
-            # position alone. Moving it caused the Client long-form cover photo
-            # to jump up into the hero header.
-            if name == "Text Box 21" or "{{main_img}}" in (
-                (docPr.get("descr") or "")
-            ):
-                anchor = next(
-                    (a for a in drawing if etree.QName(a).localname == "anchor"),
-                    None,
+            if name == "Text Box 26" and "{{address}}" in texts:
+                self._cover_pin_body_slot(
+                    drawing,
+                    "column",
+                    self.COVER_ADDR_LEFT_PT,
+                    "paragraph",
+                    self.COVER_ADDR_TOP_PT,
+                    z=251680000,
                 )
-                if anchor is not None:
-                    anchor.set("behindDoc", "0")
+                pinned += 1
+                continue
+            if name == "Text Box 21":
+                self._cover_pin_body_slot(
+                    drawing,
+                    "column",
+                    self.COVER_PHOTO_LEFT_PT,
+                    "paragraph",
+                    self.COVER_PHOTO_TOP_PT,
+                    z=251690000,
+                )
+                pinned += 1
+                continue
+            if texts.startswith("PREPARED BY"):
+                self._cover_pin_body_vertical(drawing, "paragraph", self.COVER_BY_TOP_PT)
+                pinned += 1
+                continue
+            if texts.startswith("PREPARED FOR"):
+                self._cover_pin_body_vertical(drawing, "paragraph", self.COVER_FOR_TOP_PT)
+                pinned += 1
                 continue
 
-        corner_ok = self._ensure_cover_diagonal_corner(doc)
-        tinted = self._tint_cover_hero(doc, primary, secondary)
+        for drawing in to_hide:
+            self._cover_hide_drawing(drawing)
+        self._cover_remove_legacy_title_vml(doc)
+        self._cover_remove_stray_293(doc)
+
+        hero_ok = self._apply_designed_cover_hero(doc, primary, property_data)
         logger.info(
-            "Cover polish: title_round=%s date_round=%s title_white=%s "
-            "address_corner=%s white_corner=%s hero_tint=%s theme=%s",
-            title_shaped,
-            date_shaped,
-            title_whitened,
-            addr_placed,
-            corner_ok,
-            tinted,
+            "Cover polish: hidden_overlays=%s pinned_body=%s hero=%s theme=%s primary=%s",
+            hidden,
+            pinned,
+            hero_ok,
             theme or "light blue",
+            primary,
         )
+
+    @staticmethod
+    def _cover_hide_drawing(drawing) -> None:
+        """Move leftover header overlays off-canvas."""
+        from lxml import etree
+        from docx.oxml.ns import qn
+
+        docPr = next(drawing.iter(qn("wp:docPr")), None)
+        if docPr is not None:
+            docPr.set("hidden", "1")
+        posH = next(drawing.iter(qn("wp:positionH")), None)
+        if posH is None:
+            return
+        for child in list(posH):
+            if etree.QName(child).localname in ("posOffset", "align"):
+                posH.remove(child)
+        posH.set("relativeFrom", "page")
+        off = etree.SubElement(posH, qn("wp:posOffset"))
+        off.text = "-12962255"
+
+    @staticmethod
+    def _cover_pin_body_slot(drawing, h_rel, h_off_pt, v_rel, v_off_pt, z=None) -> None:
+        """Pin a cover body shape (address / street photo) to the 2-column grid."""
+        from lxml import etree
+        from docx.oxml.ns import qn
+
+        def _emu(pt):
+            return str(int(round(pt / 72 * 914400)))
+
+        posH = next(drawing.iter(qn("wp:positionH")), None)
+        posV = next(drawing.iter(qn("wp:positionV")), None)
+        if posH is not None:
+            for child in list(posH):
+                if etree.QName(child).localname in ("posOffset", "align"):
+                    posH.remove(child)
+            posH.set("relativeFrom", h_rel)
+            off = etree.SubElement(posH, qn("wp:posOffset"))
+            off.text = _emu(h_off_pt)
+        if posV is not None:
+            for child in list(posV):
+                if etree.QName(child).localname in ("posOffset", "align"):
+                    posV.remove(child)
+            posV.set("relativeFrom", v_rel)
+            off = etree.SubElement(posV, qn("wp:posOffset"))
+            off.text = _emu(v_off_pt)
+        anchor = next(
+            (a for a in drawing if etree.QName(a).localname == "anchor"),
+            None,
+        )
+        if anchor is not None:
+            anchor.set("behindDoc", "0")
+            if z is not None:
+                anchor.set("relativeHeight", str(z))
+
+    @classmethod
+    def _cover_pin_body_vertical(cls, drawing, v_rel, v_off_pt) -> None:
+        """Change only vertical offset so PREPARED BY/FOR keep their right-column left edge."""
+        from lxml import etree
+        from docx.oxml.ns import qn
+
+        posV = next(drawing.iter(qn("wp:positionV")), None)
+        if posV is None:
+            return
+        for child in list(posV):
+            if etree.QName(child).localname in ("posOffset", "align"):
+                posV.remove(child)
+        posV.set("relativeFrom", v_rel)
+        off = etree.SubElement(posV, qn("wp:posOffset"))
+        off.text = str(int(round(v_off_pt / 72 * 914400)))
+        anchor = next(
+            (a for a in drawing if etree.QName(a).localname == "anchor"),
+            None,
+        )
+        if anchor is not None:
+            anchor.set("behindDoc", "0")
+
+    @staticmethod
+    def _cover_remove_stray_293(doc: Document) -> None:
+        """Drop the leftover '293' run in the Picture 8 paragraph."""
+        from docx.oxml.ns import qn
+
+        for p in doc.element.body.iter(qn("w:p")):
+            has_pic8 = any(
+                (dp.get("name") or "") == "Picture 8"
+                for dp in p.iter(qn("wp:docPr"))
+            )
+            if not has_pic8:
+                continue
+            for run in list(p.findall(qn("w:r"))):
+                text = "".join((t.text or "") for t in run.findall(qn("w:t")))
+                if text.strip() == "293":
+                    p.remove(run)
+
+    @staticmethod
+    def _cover_remove_legacy_title_vml(doc: Document) -> None:
+        from docx.oxml.ns import qn
+
+        for pict in list(doc.element.body.iter(qn("w:pict"))):
+            texts = " ".join((t.text or "") for t in pict.iter(qn("w:t")) if t.text)
+            if "Broker Opinion of Value" in texts or texts.strip().startswith("Date:"):
+                parent = pict.getparent()
+                if parent is not None:
+                    parent.remove(pict)
 
     @staticmethod
     def _cover_force_left_align(drawing) -> None:
@@ -5899,27 +6003,234 @@ Rules:
         return fixed
 
     def _tint_cover_hero(self, doc: Document, primary_hex: str, secondary_hex: str) -> bool:
-        """Apply a monochrome theme shade to the large cover Picture 8 hero."""
+        """Deprecated: designed header replaces the old full-photo tint."""
+        _ = secondary_hex
+        return self._apply_designed_cover_hero(doc, primary_hex, None)
+
+    @staticmethod
+    def _cover_building_source(fallback_blob: Optional[bytes] = None):
+        from io import BytesIO
+        from PIL import Image
+
+        here = Path(__file__).resolve().parent
+        for name in ("cover_building.jpg", "cover_building.png", "cover_building.jpeg"):
+            path = here / name
+            if path.exists():
+                return Image.open(path).convert("RGB")
+        if fallback_blob:
+            return Image.open(BytesIO(fallback_blob)).convert("RGB")
+        return None
+
+    def _cover_building_from_template(self):
         from io import BytesIO
         from docx.oxml.ns import qn
 
         try:
-            from PIL import Image, ImageOps
+            from PIL import Image
+            from docx import Document
         except ImportError:
-            logger.warning("Pillow missing — cannot tint cover hero")
+            return None
+        try:
+            doc = Document(self.template_path)
+            for drawing in doc.element.body.iter(qn("w:drawing")):
+                docPr = next(drawing.iter(qn("wp:docPr")), None)
+                if docPr is None or (docPr.get("name") or "") != "Picture 8":
+                    continue
+                blip = next(drawing.iter(qn("a:blip")), None)
+                if blip is None:
+                    continue
+                rid = blip.get(qn("r:embed"))
+                part = doc.part.related_parts.get(rid) if rid else None
+                if part is not None and getattr(part, "_blob", None):
+                    return Image.open(BytesIO(part._blob)).convert("RGB")
+        except Exception as exc:
+            logger.warning("Could not load cover building from template: %s", exc)
+        return None
+
+    @staticmethod
+    def _cover_fit_photo(photo, width: int, height: int):
+        from PIL import Image
+
+        img = photo.convert("RGB")
+        sw, sh = img.size
+        scale = max(width / sw, height / sh) * 1.18
+        nw, nh = max(1, int(round(sw * scale))), max(1, int(round(sh * scale)))
+        img = img.resize((nw, nh), Image.LANCZOS)
+        left = max(0, int((nw - width) * 0.72))
+        top = max(0, int((nh - height) * 0.18))
+        return img.crop((left, top, left + width, top + height))
+
+    @staticmethod
+    def _cover_resize_drawing(drawing, width_pt: float, height_pt: float) -> None:
+        from docx.oxml.ns import qn
+
+        cx = str(int(round(width_pt * 12700)))
+        cy = str(int(round(height_pt * 12700)))
+        a_ext = "{http://schemas.openxmlformats.org/drawingml/2006/main}ext"
+        for ext in list(drawing.iter(qn("wp:extent"))) + list(drawing.iter(a_ext)):
+            if ext.get("cx") is None and ext.get("cy") is None:
+                continue
+            ext.set("cx", cx)
+            ext.set("cy", cy)
+
+    @staticmethod
+    def _cover_clear_picture_tint(drawing) -> None:
+        from lxml import etree
+
+        a_sppr = "{http://schemas.openxmlformats.org/drawingml/2006/picture}spPr"
+        a_ns = "{http://schemas.openxmlformats.org/drawingml/2006/main}"
+        for spPr in list(drawing.iter(a_sppr)) + list(drawing.iter(a_ns + "spPr")):
+            for child in list(spPr):
+                if etree.QName(child).localname in ("gradFill", "solidFill", "pattFill"):
+                    spPr.remove(child)
+
+    @classmethod
+    def _render_cover_hero_image(
+        cls,
+        width: int,
+        height: int,
+        panel_rgb,
+        building,
+        property_type: str = "",
+        date_text: str = "",
+    ):
+        """Required design: 60% theme panel left, 40% building right, white chevron."""
+        from PIL import Image, ImageDraw, ImageFont
+
+        scale = 2
+        W, H = width * scale, height * scale
+        s = W / 744.0
+
+        def xy(x, y):
+            return (int(round(x * s)), int(round(y * s)))
+
+        def poly(points):
+            return [xy(x, y) for x, y in points]
+
+        base = Image.new("RGBA", (W, H), (255, 255, 255, 255))
+        photo = cls._cover_fit_photo(building, W, H).convert("RGBA")
+        base.paste(photo, (0, 0))
+
+        overlay = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+        od = ImageDraw.Draw(overlay)
+        pr, pg, pb = panel_rgb
+        od.polygon(
+            poly([(0, 0), (446, 0), (446, 270), (108, 428), (0, 440)]),
+            fill=(pr, pg, pb, 255),
+        )
+        od.polygon(
+            poly([(0, 392), (0, 440), (430, 440), (120, 408)]),
+            fill=(255, 255, 255, 255),
+        )
+        hero = Image.alpha_composite(base, overlay)
+        draw = ImageDraw.Draw(hero)
+        white = (255, 255, 255, 255)
+
+        def font(paths, size):
+            if isinstance(paths, str):
+                paths = (paths,)
+            for path in paths:
+                try:
+                    return ImageFont.truetype(path, max(8, int(round(size * s))))
+                except Exception:
+                    continue
+            return ImageFont.load_default()
+
+        serif = font(
+            (r"C:\Windows\Fonts\pala.ttf", r"C:\Windows\Fonts\georgia.ttf"),
+            52,
+        )
+        sans = font(r"C:\Windows\Fonts\segoeuil.ttf", 12)
+        sans_reg = font(r"C:\Windows\Fonts\segoeui.ttf", 9)
+        value_font = font(r"C:\Windows\Fonts\segoeui.ttf", 12)
+
+        def tracked(pos, text, fnt, spacing):
+            x, y = xy(*pos)
+            gap = int(round(spacing * s))
+            for ch in text:
+                draw.text((x, y), ch, font=fnt, fill=white)
+                try:
+                    x += int(fnt.getlength(ch)) + gap
+                except Exception:
+                    x += int(round(7 * s)) + gap
+
+        line_w = max(2, int(round(1.5 * s)))
+        draw.line([xy(268, 56), xy(420, 56)], fill=white, width=line_w)
+        tracked((44, 48), "BROKER", sans, 7.0)
+        draw.text(xy(36, 78), "Opinion", font=serif, fill=white)
+        draw.text(xy(36, 132), "of Value", font=serif, fill=white)
+
+        def circle_icon(cx, cy, kind):
+            r = 15
+            c = xy(cx, cy)
+            rr = int(round(r * s))
+            lw = max(2, int(round(1.4 * s)))
+            draw.ellipse(
+                [c[0] - rr, c[1] - rr, c[0] + rr, c[1] + rr],
+                outline=white,
+                width=lw,
+            )
+            if kind == "building":
+                bw, bh = int(round(8 * s)), int(round(9 * s))
+                x0, y0 = c[0] - bw // 2, c[1] - bh // 2 + int(round(1 * s))
+                draw.rectangle([x0, y0, x0 + bw, y0 + bh], outline=white, width=lw)
+                gap = max(1, int(round(2.0 * s)))
+                draw.line(
+                    [(x0 + gap, y0 + gap), (x0 + gap, y0 + bh - gap)],
+                    fill=white,
+                    width=lw,
+                )
+                draw.line(
+                    [(x0 + bw - gap, y0 + gap), (x0 + bw - gap, y0 + bh - gap)],
+                    fill=white,
+                    width=lw,
+                )
+            else:
+                cw, ch = int(round(10 * s)), int(round(8 * s))
+                x0, y0 = c[0] - cw // 2, c[1] - ch // 2 + int(round(1 * s))
+                draw.rectangle([x0, y0, x0 + cw, y0 + ch], outline=white, width=lw)
+                draw.line(
+                    [(x0, y0 + int(round(2.4 * s))), (x0 + cw, y0 + int(round(2.4 * s)))],
+                    fill=white,
+                    width=lw,
+                )
+
+        circle_icon(52, 300, "building")
+        tracked((76, 292), "PROPERTY TYPE", sans_reg, 2.4)
+        if property_type:
+            draw.text(xy(76, 312), property_type, font=value_font, fill=white)
+        circle_icon(52, 362, "calendar")
+        tracked((76, 354), "DATE", sans_reg, 3.0)
+        if date_text:
+            draw.text(xy(76, 374), date_text, font=value_font, fill=white)
+
+        return hero.convert("RGB").resize((width, height), Image.LANCZOS)
+
+    def _apply_designed_cover_hero(
+        self, doc: Document, primary_hex: str, property_data=None
+    ) -> bool:
+        """Replace Picture 8 with the required header: theme panel + building."""
+        from io import BytesIO
+        from docx.oxml.ns import qn
+
+        try:
+            from PIL import Image
+        except ImportError:
+            logger.warning("Pillow missing — cannot apply designed cover hero")
             return False
 
         def _rgb(h: str):
             h = (h or "0070C0").strip().lstrip("#")
             return tuple(int(h[i : i + 2], 16) for i in (0, 2, 4))
 
-        primary = _rgb(primary_hex)
-        secondary = _rgb(secondary_hex)
-        # Dark end of duotone (shadows) + light end (highlights) for a wash look
-        dark = tuple(max(0, c // 5) for c in primary)
-        light = tuple(min(255, int(c + (255 - c) * 0.55)) for c in secondary)
+        panel = _rgb(primary_hex)
+        prop_type = ""
+        date_text = ""
+        if property_data is not None:
+            prop_type = (getattr(property_data, "property_type", None) or "").strip().title()
+            date_text = (getattr(property_data, "date", None) or "").strip()
 
-        tinted = False
+        applied = False
         for drawing in doc.element.body.iter(qn("w:drawing")):
             docPr = next(drawing.iter(qn("wp:docPr")), None)
             if docPr is None or (docPr.get("name") or "") != "Picture 8":
@@ -5927,7 +6238,7 @@ Rules:
             ext = next(drawing.iter(qn("wp:extent")), None)
             cx = int(ext.get("cx") or 0) if ext is not None else 0
             if cx < 6_000_000:
-                continue  # ignore leftover tiny copies
+                continue
             blip = next(drawing.iter(qn("a:blip")), None)
             if blip is None:
                 continue
@@ -5936,28 +6247,164 @@ Rules:
             if part is None or not getattr(part, "_blob", None):
                 continue
             try:
-                img = Image.open(BytesIO(part._blob)).convert("RGB")
-                gray = ImageOps.grayscale(img)
-                colored = ImageOps.colorize(gray, black=dark, white=light)
+                building = self._cover_building_source(part._blob)
+                if building is None:
+                    logger.warning("Cover building photo missing")
+                    continue
+                self._cover_building_image = building
+                img = self._render_cover_hero_image(
+                    self.COVER_HERO_PX[0], self.COVER_HERO_PX[1],
+                    panel, building, prop_type, date_text,
+                )
                 buf = BytesIO()
-                # Keep JPEG for typical cover parts
-                partname = str(getattr(part, "partname", "") or "").lower()
-                ctype = str(getattr(part, "content_type", "") or "").lower()
-                if partname.endswith(".png") or "image/png" in ctype:
-                    colored.convert("RGBA").save(buf, format="PNG", optimize=True)
-                else:
-                    colored.save(buf, format="JPEG", quality=85, optimize=True)
+                img.save(buf, format="JPEG", quality=92, optimize=True)
                 part._blob = buf.getvalue()
-                tinted = True
+                self._cover_resize_drawing(
+                    drawing, self.COVER_HERO_WIDTH_PT, self.COVER_HERO_HEIGHT_PT
+                )
+                self._cover_clear_picture_tint(drawing)
+                applied = True
                 logger.info(
-                    "Tinted cover hero Picture 8 with theme shade %s→%s (%s bytes)",
+                    "Cover header composited panel=%s type=%r date=%r",
                     primary_hex,
-                    secondary_hex,
-                    len(part._blob),
+                    prop_type,
+                    date_text,
                 )
             except Exception as exc:
-                logger.error("Cover hero tint failed: %s", exc)
-        return tinted
+                logger.error("Designed cover hero failed: %s", exc)
+        return applied
+
+    @staticmethod
+    def _rewrite_docx_preserving_zip(path, transform) -> None:
+        import zipfile
+        import tempfile
+        import os as _os
+
+        path = Path(path)
+        tmp_fd, tmp_path = tempfile.mkstemp(suffix=".docx")
+        _os.close(tmp_fd)
+        try:
+            with zipfile.ZipFile(path, "r") as zin, zipfile.ZipFile(tmp_path, "w") as zout:
+                for item in zin.infolist():
+                    data = zin.read(item.filename)
+                    name = item.filename.replace("\\", "/")
+                    data = transform(name, data)
+                    if data is None:
+                        continue
+                    info = zipfile.ZipInfo(filename=item.filename, date_time=item.date_time)
+                    info.compress_type = item.compress_type
+                    info.external_attr = item.external_attr
+                    info.create_system = item.create_system
+                    zout.writestr(info, data)
+            _os.replace(tmp_path, path)
+        except Exception:
+            try:
+                _os.unlink(tmp_path)
+            except Exception:
+                pass
+            raise
+
+    def _stamp_cover_hero_file(self, output_path, color_theme, property_data) -> None:
+        """Write the designed header into the saved docx after Word COM."""
+        import zipfile
+
+        path = Path(output_path)
+        if not path.exists():
+            return
+        primary = self._theme_primary_hex(color_theme)
+        logger.info(
+            "Cover stamp theme=%r primary=%s",
+            self._normalize_color_theme(color_theme),
+            primary,
+        )
+        building = self._cover_building_source() or getattr(self, "_cover_building_image", None)
+        if building is None:
+            building = self._cover_building_from_template()
+        if building is None:
+            logger.warning("Cover stamp skipped — cover building photo missing")
+            return
+        prop_type = ""
+        date_text = ""
+        if property_data is not None:
+            prop_type = (getattr(property_data, "property_type", None) or "").strip().title()
+            date_text = (getattr(property_data, "date", None) or "").strip()
+        img = self._render_cover_hero_image(
+            self.COVER_HERO_PX[0], self.COVER_HERO_PX[1],
+            tuple(int(primary[i : i + 2], 16) for i in (0, 2, 4)),
+            building, prop_type, date_text,
+        )
+        from io import BytesIO
+        buf = BytesIO()
+        img.save(buf, format="JPEG", quality=92, optimize=True)
+        blob = buf.getvalue()
+
+        import re as _re
+        media_names = {
+            "word/media/image1.jpeg",
+            "word/media/image1.jpg",
+        }
+        try:
+            with zipfile.ZipFile(path, "r") as zin:
+                xml = zin.read("word/document.xml").decode("utf-8", "ignore")
+                rels = zin.read("word/_rels/document.xml.rels").decode("utf-8", "ignore")
+            hit = _re.search(
+                r'name="Picture 8".{0,1600}?r:embed="(rId[^"]+)"',
+                xml,
+                _re.DOTALL,
+            )
+            if hit:
+                rid = hit.group(1)
+                tgt = _re.search(
+                    rf'Id="{_re.escape(rid)}"[^>]*Target="([^"]+)"',
+                    rels,
+                )
+                if tgt:
+                    target = tgt.group(1).replace("\\", "/")
+                    if not target.startswith("word/"):
+                        target = "word/" + target.lstrip("/")
+                    media_names.add(target)
+        except Exception as exc:
+            logger.warning("Cover stamp: could not resolve Picture 8 media: %s", exc)
+
+        replaced = []
+
+        def _stamp_member(name, data):
+            if name in media_names:
+                replaced.append(name)
+                return blob
+            if name == "word/document.xml":
+                return self._strip_picture8_gradfill(data)
+            return data
+
+        self._rewrite_docx_preserving_zip(path, _stamp_member)
+        if replaced:
+            logger.info("Cover header stamped into %s (%s)", path.name, replaced)
+        else:
+            logger.warning("Cover stamp: no cover media found in %s", path.name)
+
+    @staticmethod
+    def _strip_picture8_gradfill(xml_bytes: bytes) -> bytes:
+        import re as _re
+
+        try:
+            text = xml_bytes.decode("utf-8")
+        except Exception:
+            return xml_bytes
+
+        def repl(match):
+            chunk = match.group(0)
+            return _re.sub(r"<a:gradFill>.*?</a:gradFill>", "", chunk, flags=_re.S)
+
+        updated = _re.sub(
+            r'(name="Picture 8".{0,8000}?</w:drawing>)',
+            repl,
+            text,
+            count=1,
+            flags=_re.S,
+        )
+        if updated == text:
+            return xml_bytes
+        return updated.encode("utf-8")
 
     def _apply_color_theme(self, output_path, color_theme: str):
         """Recolor report accents, including header/footer bars.
