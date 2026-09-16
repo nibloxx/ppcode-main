@@ -6138,7 +6138,7 @@ Rules:
         # Theme panel: 60% left, diagonal cut from high on the right edge
         # down to the white bar — no leftover green below that line.
         od.polygon(
-            poly([(0, 0), (446, 0), (446, 238), (125, 402), (0, 402)]),
+            poly([(0, 0), (446, 0), (446, 218), (125, 402), (0, 402)]),
             fill=(pr, pg, pb, 255),
         )
         hero = Image.alpha_composite(base, overlay)
