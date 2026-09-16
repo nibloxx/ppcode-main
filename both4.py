@@ -4554,20 +4554,20 @@ Rules:
                 try:
                     shape.RelativeHorizontalPosition = 2  # column
                     shape.Left = self.COVER_PHOTO_LEFT_PT
-                    shape.RelativeVerticalPosition = 2  # paragraph
+                    shape.RelativeVerticalPosition = 1  # page
                     shape.Top = self.COVER_PHOTO_TOP_PT
                     shape.ZOrder(0)
                 except Exception as exc:
                     logger.warning("Cover fix: could not pin Street View: %s", exc)
             elif name.startswith("Text Box") and text.startswith("PREPARED BY"):
                 try:
-                    shape.RelativeVerticalPosition = 2
+                    shape.RelativeVerticalPosition = 1  # page
                     shape.Top = self.COVER_BY_TOP_PT
                 except Exception:
                     pass
             elif name.startswith("Text Box") and text.startswith("PREPARED FOR"):
                 try:
-                    shape.RelativeVerticalPosition = 2
+                    shape.RelativeVerticalPosition = 1  # page
                     shape.Top = self.COVER_FOR_TOP_PT
                 except Exception:
                     pass
@@ -4698,13 +4698,13 @@ Rules:
                 # not the old -64pt hang that sat too far left vs the short template.
                 try:
                     # wdRelativeHorizontalPositionColumn = 2
-                    # wdRelativeVerticalPositionParagraph = 2
+                    # wdRelativeVerticalPositionPage = 1
                     addr.RelativeHorizontalPosition = 2
-                    addr.RelativeVerticalPosition = 2
+                    addr.RelativeVerticalPosition = 1
                     addr.Left = self.COVER_ADDR_LEFT_PT
                     addr.Top = self.COVER_ADDR_TOP_PT
                     addr.Width = 312.6
-                    addr.Height = 68.4
+                    addr.Height = self.COVER_ADDR_HEIGHT_PT
                 except Exception:
                     pass
                 try:
@@ -5601,14 +5601,19 @@ Rules:
     TEMPLATE_HEADER_FOOTER_ACCENT = "0066CC"
 
     COVER_HERO_WIDTH_PT = 611.95
-    COVER_HERO_HEIGHT_PT = 360.0
-    COVER_HERO_PX = (1836, 1080)
+    COVER_HERO_HEIGHT_PT = 435.0
+    COVER_HERO_PX = (1836, 1305)
+    # Hero is paragraph -72pt on the first body para (top margin 72pt) => page y 0..435.
+    # Address/photo/BY/FOR live in a later paragraph, so pin them to the PAGE
+    # or they sit 370pt below that later para and leave a large white gap.
+    COVER_BODY_VREL = "page"
     COVER_ADDR_LEFT_PT = -32.63
-    COVER_ADDR_TOP_PT = 294.15
+    COVER_ADDR_TOP_PT = 473.0
+    COVER_ADDR_HEIGHT_PT = 36.0
     COVER_PHOTO_LEFT_PT = -32.63
-    COVER_PHOTO_TOP_PT = 373.47
-    COVER_BY_TOP_PT = 373.47
-    COVER_FOR_TOP_PT = 481.07
+    COVER_PHOTO_TOP_PT = 499.0
+    COVER_BY_TOP_PT = 499.0
+    COVER_FOR_TOP_PT = 606.6
 
     def _normalize_color_theme(self, color_theme: Optional[str]) -> str:
         """Map UI values like light-blue / darkblue / #0070C0 -> canonical keys."""
@@ -5664,10 +5669,11 @@ Rules:
         color_theme: Optional[str] = None,
         property_data=None,
     ) -> None:
-        """Designed cover hero in Picture 8 only.
+        """Designed cover hero in Picture 8; pin the 2-column body to the page.
 
-        Bottom block (address, Street View, PREPARED BY/FOR) is not moved.
-        Old title/date bars and Group 13 are hidden so they cannot cover it.
+        Address / Street View / PREPARED BY/FOR live in a later paragraph than
+        the hero, so they must be page-relative or they drop into a white gap
+        and the photo hits the footer.
         """
         from docx.oxml.ns import qn
 
@@ -5699,9 +5705,10 @@ Rules:
                     drawing,
                     "column",
                     self.COVER_ADDR_LEFT_PT,
-                    "paragraph",
+                    self.COVER_BODY_VREL,
                     self.COVER_ADDR_TOP_PT,
                     z=251680000,
+                    height_pt=self.COVER_ADDR_HEIGHT_PT,
                 )
                 pinned += 1
                 continue
@@ -5710,18 +5717,22 @@ Rules:
                     drawing,
                     "column",
                     self.COVER_PHOTO_LEFT_PT,
-                    "paragraph",
+                    self.COVER_BODY_VREL,
                     self.COVER_PHOTO_TOP_PT,
                     z=251690000,
                 )
                 pinned += 1
                 continue
             if texts.startswith("PREPARED BY"):
-                self._cover_pin_body_vertical(drawing, "paragraph", self.COVER_BY_TOP_PT)
+                self._cover_pin_body_vertical(
+                    drawing, self.COVER_BODY_VREL, self.COVER_BY_TOP_PT
+                )
                 pinned += 1
                 continue
             if texts.startswith("PREPARED FOR"):
-                self._cover_pin_body_vertical(drawing, "paragraph", self.COVER_FOR_TOP_PT)
+                self._cover_pin_body_vertical(
+                    drawing, self.COVER_BODY_VREL, self.COVER_FOR_TOP_PT
+                )
                 pinned += 1
                 continue
 
@@ -5760,7 +5771,9 @@ Rules:
         off.text = "-12962255"
 
     @staticmethod
-    def _cover_pin_body_slot(drawing, h_rel, h_off_pt, v_rel, v_off_pt, z=None) -> None:
+    def _cover_pin_body_slot(
+        drawing, h_rel, h_off_pt, v_rel, v_off_pt, z=None, height_pt=None
+    ) -> None:
         """Pin a cover body shape (address / street photo) to the 2-column grid."""
         from lxml import etree
         from docx.oxml.ns import qn
@@ -5784,6 +5797,12 @@ Rules:
             posV.set("relativeFrom", v_rel)
             off = etree.SubElement(posV, qn("wp:posOffset"))
             off.text = _emu(v_off_pt)
+        if height_pt is not None:
+            cy = str(int(round(height_pt * 12700)))
+            a_ext = "{http://schemas.openxmlformats.org/drawingml/2006/main}ext"
+            for ext in list(drawing.iter(qn("wp:extent"))) + list(drawing.iter(a_ext)):
+                if ext.get("cy") is not None:
+                    ext.set("cy", cy)
         anchor = next(
             (a for a in drawing if etree.QName(a).localname == "anchor"),
             None,
@@ -6094,15 +6113,17 @@ Rules:
         property_type: str = "",
         date_text: str = "",
     ):
-        """Required design: 60% theme panel left, 40% building right, white chevron."""
+        """Required design: 60% theme panel left (full banner height), 40% building right, white chevron bottom."""
         from PIL import Image, ImageDraw, ImageFont
 
         scale = 2
         W, H = width * scale, height * scale
-        s = W / 744.0
+        sx = W / 744.0
+        sy = H / 440.0
+        s = sx
 
         def xy(x, y):
-            return (int(round(x * s)), int(round(y * s)))
+            return (int(round(x * sx)), int(round(y * sy)))
 
         def poly(points):
             return [xy(x, y) for x, y in points]
@@ -6114,12 +6135,16 @@ Rules:
         overlay = Image.new("RGBA", (W, H), (0, 0, 0, 0))
         od = ImageDraw.Draw(overlay)
         pr, pg, pb = panel_rgb
+        # Theme panel fills the left 60% for the full hero height, then a
+        # bottom-left diagonal like the required design — no leftover building
+        # showing under a short overlay.
         od.polygon(
-            poly([(0, 0), (446, 0), (446, 270), (108, 428), (0, 440)]),
+            poly([(0, 0), (446, 0), (446, 268), (118, 418), (0, 440)]),
             fill=(pr, pg, pb, 255),
         )
+        # White ending chevron across the bottom (clips panel + building).
         od.polygon(
-            poly([(0, 392), (0, 440), (430, 440), (120, 408)]),
+            poly([(0, 392), (0, 440), (744, 440), (744, 428), (420, 436), (130, 408)]),
             fill=(255, 255, 255, 255),
         )
         hero = Image.alpha_composite(base, overlay)
