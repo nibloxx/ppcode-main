@@ -6114,7 +6114,7 @@ Rules:
         date_text: str = "",
     ):
         """Required design: 60% theme panel left (full banner height), 40% building right, white chevron bottom."""
-        from PIL import Image, ImageDraw, ImageFont
+        from PIL import Image, ImageDraw, ImageFont, ImageFilter
 
         scale = 2
         W, H = width * scale, height * scale
@@ -6142,12 +6142,28 @@ Rules:
             poly([(0, 0), (446, 0), (446, 268), (118, 418), (0, 440)]),
             fill=(pr, pg, pb, 255),
         )
-        # White ending chevron across the bottom (clips panel + building).
-        od.polygon(
-            poly([(0, 392), (0, 440), (744, 440), (744, 428), (420, 436), (130, 408)]),
+        hero = Image.alpha_composite(base, overlay)
+
+        # Required edge: perfectly flat bar, short clean diagonal, thin strip.
+        # Drawn on its own layer and slightly blurred so the cut is smooth.
+        white_edge = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+        wed = ImageDraw.Draw(white_edge)
+        # Required edge: straight horizontal bar, SHORT straight diagonal, thin strip.
+        white_edge = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+        wed = ImageDraw.Draw(white_edge)
+        wed.polygon(
+            poly([
+                (0, 402),
+                (428, 402),
+                (452, 434),
+                (744, 434),
+                (744, 440),
+                (0, 440),
+            ]),
             fill=(255, 255, 255, 255),
         )
-        hero = Image.alpha_composite(base, overlay)
+        white_edge = white_edge.filter(ImageFilter.GaussianBlur(radius=0.6))
+        hero = Image.alpha_composite(hero, white_edge)
         draw = ImageDraw.Draw(hero)
         white = (255, 255, 255, 255)
 
