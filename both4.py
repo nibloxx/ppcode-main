@@ -6135,20 +6135,14 @@ Rules:
         overlay = Image.new("RGBA", (W, H), (0, 0, 0, 0))
         od = ImageDraw.Draw(overlay)
         pr, pg, pb = panel_rgb
-        # Theme panel fills the left 60% for the full hero height, then a
-        # bottom-left diagonal like the required design — no leftover building
-        # showing under a short overlay.
+        # Theme panel: 60% left, diagonal cut from high on the right edge
+        # down to the white bar — no leftover green below that line.
         od.polygon(
-            poly([(0, 0), (446, 0), (446, 268), (118, 418), (0, 440)]),
+            poly([(0, 0), (446, 0), (446, 238), (125, 402), (0, 402)]),
             fill=(pr, pg, pb, 255),
         )
         hero = Image.alpha_composite(base, overlay)
 
-        # Required edge: perfectly flat bar, short clean diagonal, thin strip.
-        # Drawn on its own layer and slightly blurred so the cut is smooth.
-        white_edge = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-        wed = ImageDraw.Draw(white_edge)
-        # Required edge: straight horizontal bar, SHORT straight diagonal, thin strip.
         white_edge = Image.new("RGBA", (W, H), (0, 0, 0, 0))
         wed = ImageDraw.Draw(white_edge)
         wed.polygon(
