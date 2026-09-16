@@ -6163,11 +6163,25 @@ Rules:
 
         serif = font(
             (r"C:\Windows\Fonts\pala.ttf", r"C:\Windows\Fonts\georgia.ttf"),
-            52,
+            54,
         )
-        sans = font(r"C:\Windows\Fonts\segoeuil.ttf", 12)
-        sans_reg = font(r"C:\Windows\Fonts\segoeui.ttf", 9)
+        sans_broker = font(
+            (
+                r"C:\Windows\Fonts\seguisb.ttf",
+                r"C:\Windows\Fonts\segoeuib.ttf",
+                r"C:\Windows\Fonts\segoeui.ttf",
+            ),
+            13,
+        )
+        sans_reg = font(
+            (r"C:\Windows\Fonts\seguisb.ttf", r"C:\Windows\Fonts\segoeui.ttf"),
+            9,
+        )
         value_font = font(r"C:\Windows\Fonts\segoeui.ttf", 12)
+        icon_font = font(
+            (r"C:\Windows\Fonts\segmdl2.ttf", r"C:\Windows\Fonts\SegoeIcons.ttf"),
+            13,
+        )
 
         def tracked(pos, text, fnt, spacing):
             x, y = xy(*pos)
@@ -6179,55 +6193,59 @@ Rules:
                 except Exception:
                     x += int(round(7 * s)) + gap
 
-        line_w = max(2, int(round(1.5 * s)))
-        draw.line([xy(268, 56), xy(420, 56)], fill=white, width=line_w)
-        tracked((44, 48), "BROKER", sans, 7.0)
-        draw.text(xy(36, 78), "Opinion", font=serif, fill=white)
-        draw.text(xy(36, 132), "of Value", font=serif, fill=white)
+        def text_box(pos, text, fnt):
+            x, y = xy(*pos)
+            return draw.textbbox((x, y), text, font=fnt)
+
+        line_w = max(3, int(round(2.5 * s)))
+        # Top rule sits above BROKER on the right — not beside the word.
+        draw.line([xy(296, 44), xy(420, 44)], fill=white, width=line_w)
+        tracked((36, 52), "BROKER", sans_broker, 6.0)
+        draw.text(xy(32, 76), "Opinion", font=serif, fill=white)
+        draw.text(xy(32, 130), "of Value", font=serif, fill=white)
+        # Matching short rule under the title.
+        draw.line([xy(36, 186), xy(150, 186)], fill=white, width=line_w)
 
         def circle_icon(cx, cy, kind):
             r = 15
             c = xy(cx, cy)
             rr = int(round(r * s))
-            lw = max(2, int(round(1.4 * s)))
+            lw = max(2, int(round(1.5 * s)))
             draw.ellipse(
                 [c[0] - rr, c[1] - rr, c[0] + rr, c[1] + rr],
                 outline=white,
                 width=lw,
             )
-            if kind == "building":
-                bw, bh = int(round(8 * s)), int(round(9 * s))
-                x0, y0 = c[0] - bw // 2, c[1] - bh // 2 + int(round(1 * s))
-                draw.rectangle([x0, y0, x0 + bw, y0 + bh], outline=white, width=lw)
-                gap = max(1, int(round(2.0 * s)))
-                draw.line(
-                    [(x0 + gap, y0 + gap), (x0 + gap, y0 + bh - gap)],
-                    fill=white,
-                    width=lw,
-                )
-                draw.line(
-                    [(x0 + bw - gap, y0 + gap), (x0 + bw - gap, y0 + bh - gap)],
-                    fill=white,
-                    width=lw,
-                )
-            else:
-                cw, ch = int(round(10 * s)), int(round(8 * s))
-                x0, y0 = c[0] - cw // 2, c[1] - ch // 2 + int(round(1 * s))
-                draw.rectangle([x0, y0, x0 + cw, y0 + ch], outline=white, width=lw)
-                draw.line(
-                    [(x0, y0 + int(round(2.4 * s))), (x0 + cw, y0 + int(round(2.4 * s)))],
-                    fill=white,
-                    width=lw,
-                )
+            glyph = "\uEC06" if kind == "building" else "\uE787"
+            bbox = draw.textbbox((0, 0), glyph, font=icon_font)
+            gw = bbox[2] - bbox[0]
+            gh = bbox[3] - bbox[1]
+            draw.text(
+                (c[0] - gw // 2 - bbox[0], c[1] - gh // 2 - bbox[1]),
+                glyph,
+                font=icon_font,
+                fill=white,
+            )
 
-        circle_icon(52, 300, "building")
-        tracked((76, 292), "PROPERTY TYPE", sans_reg, 2.4)
-        if property_type:
-            draw.text(xy(76, 312), property_type, font=value_font, fill=white)
-        circle_icon(52, 362, "calendar")
-        tracked((76, 354), "DATE", sans_reg, 3.0)
-        if date_text:
-            draw.text(xy(76, 374), date_text, font=value_font, fill=white)
+        def meta_block(top_y, kind, label, value, tracking):
+            """Icon vertically centered on the label + value stack."""
+            label_box = text_box((76, top_y), "A", sans_reg)
+            label_h = max(1, label_box[3] - label_box[1])
+            if value:
+                value_box = text_box((76, top_y + 18), value, value_font)
+                block_top = xy(76, top_y)[1]
+                block_bot = value_box[3]
+            else:
+                block_top = xy(76, top_y)[1]
+                block_bot = block_top + label_h
+            icon_cy = (block_top + block_bot) / 2.0 / sy
+            circle_icon(52, icon_cy, kind)
+            tracked((76, top_y), label, sans_reg, tracking)
+            if value:
+                draw.text(xy(76, top_y + 18), value, font=value_font, fill=white)
+
+        meta_block(228, "building", "PROPERTY TYPE", property_type, 2.4)
+        meta_block(284, "calendar", "DATE", date_text, 3.0)
 
         return hero.convert("RGB").resize((width, height), Image.LANCZOS)
 
