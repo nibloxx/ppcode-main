@@ -6143,6 +6143,23 @@ Rules:
         )
         hero = Image.alpha_composite(base, overlay)
 
+        # Required: white shade on the LOWER building only (marked region).
+        # Apex = panel diagonal start; opens downward along the panel cut
+        # and down-right across the facade — not the upper-right sky triangle.
+        shade = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+        sd = ImageDraw.Draw(shade)
+        sd.polygon(
+            poly([
+                (446, 218),
+                (744, 380),
+                (744, 440),
+                (125, 402),
+            ]),
+            fill=(255, 255, 255, 95),
+        )
+        shade = shade.filter(ImageFilter.GaussianBlur(radius=1.5))
+        hero = Image.alpha_composite(hero, shade)
+
         white_edge = Image.new("RGBA", (W, H), (0, 0, 0, 0))
         wed = ImageDraw.Draw(white_edge)
         wed.polygon(
