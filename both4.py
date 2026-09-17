@@ -6089,11 +6089,11 @@ Rules:
 
         img = photo.convert("RGB")
         sw, sh = img.size
-        scale = max(width / sw, height / sh) * 1.18
+        scale = max(width / sw, height / sh) * 1.22
         nw, nh = max(1, int(round(sw * scale))), max(1, int(round(sh * scale)))
         img = img.resize((nw, nh), Image.LANCZOS)
-        left = max(0, int((nw - width) * 0.72))
-        top = max(0, int((nh - height) * 0.18))
+        left = max(0, int((nw - width) * 0.00))
+        top = max(0, int((nh - height) * 0.65))
         return img.crop((left, top, left + width, top + height))
 
     @staticmethod
