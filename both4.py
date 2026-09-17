@@ -2981,6 +2981,31 @@ Rules:
         if replaced:
             logger.info("Swept leftover placeholders in %d paragraph(s)", replaced)
 
+    @staticmethod
+    def _write_textbox_multiline(t_node, text: str) -> None:
+        """Write multi-line text into a w:t by inserting real Word line breaks.
+
+        A literal \\n inside w:t is ignored, so the cover address wrapped as one
+        line and the ZIP was clipped by the text-box height.
+        """
+        from docx.oxml import OxmlElement
+        from docx.oxml.ns import qn
+
+        lines = str(text).split("\n")
+        t_node.text = lines[0]
+        if t_node.text.startswith(" ") or t_node.text.endswith(" "):
+            t_node.set(qn("xml:space"), "preserve")
+        insert_after = t_node
+        for line in lines[1:]:
+            br = OxmlElement("w:br")
+            nxt = OxmlElement("w:t")
+            nxt.text = line
+            if line.startswith(" ") or line.endswith(" "):
+                nxt.set(qn("xml:space"), "preserve")
+            insert_after.addnext(br)
+            br.addnext(nxt)
+            insert_after = nxt
+
     def _replace_in_textboxes(self, doc: Document, replacements: Dict[str, str]):
         """Replace placeholders inside text boxes (cover, side bars) and headers/footers.
 
@@ -3027,6 +3052,8 @@ Rules:
                         nodes[0].set(qn("xml:space"), "preserve")
                     for n in nodes[1:]:
                         n.text = ""
+                    if "\n" in new_text:
+                        self._write_textbox_multiline(nodes[0], new_text)
                 # Preserve trailing space after PREPARED labels
                 if nodes and nodes[0].text:
                     stripped = nodes[0].text.strip()
@@ -4669,17 +4696,13 @@ Rules:
         # address on top of the Street View.
         if addr is not None:
             try:
-                raw = (addr.TextFrame.TextRange.Text or "").replace("\r", "").strip()
+                raw = (addr.TextFrame.TextRange.Text or "").replace("\r", " ")
                 raw = raw.replace("\v", " ").replace("\n", " ")
                 while "  " in raw:
                     raw = raw.replace("  ", " ")
-                parts = [p.strip() for p in raw.split(",") if p.strip()]
-                if len(parts) >= 3:
-                    addr.TextFrame.TextRange.Text = (
-                        f"{parts[0]},\r{', '.join(parts[1:])}"
-                    )
-                elif len(parts) == 2:
-                    addr.TextFrame.TextRange.Text = f"{parts[0]},\r{parts[1]}"
+                formatted = self._format_cover_address(raw.strip())
+                if formatted:
+                    addr.TextFrame.TextRange.Text = formatted.replace("\n", "\r")
                 try:
                     addr.Line.Visible = 0
                     addr.Fill.Visible = 0
@@ -4689,7 +4712,7 @@ Rules:
                     tf = addr.TextFrame
                     tf.MarginLeft = 2.0
                     tf.MarginRight = 2.0
-                    tf.MarginTop = 1.0
+                    tf.MarginTop = 0.0
                     tf.MarginBottom = 1.0
                     tf.WordWrap = True
                 except Exception:
@@ -4703,7 +4726,7 @@ Rules:
                     addr.RelativeVerticalPosition = 1
                     addr.Left = self.COVER_ADDR_LEFT_PT
                     addr.Top = self.COVER_ADDR_TOP_PT
-                    addr.Width = 312.6
+                    addr.Width = self.COVER_ADDR_WIDTH_PT
                     addr.Height = self.COVER_ADDR_HEIGHT_PT
                 except Exception:
                     pass
@@ -5608,8 +5631,9 @@ Rules:
     # or they sit 370pt below that later para and leave a large white gap.
     COVER_BODY_VREL = "page"
     COVER_ADDR_LEFT_PT = -32.63
-    COVER_ADDR_TOP_PT = 473.0
-    COVER_ADDR_HEIGHT_PT = 36.0
+    COVER_ADDR_TOP_PT = 428.0
+    COVER_ADDR_HEIGHT_PT = 66.0
+    COVER_ADDR_WIDTH_PT = 312.6
     COVER_PHOTO_LEFT_PT = -32.63
     COVER_PHOTO_TOP_PT = 499.0
     COVER_BY_TOP_PT = 499.0
@@ -5645,23 +5669,14 @@ Rules:
 
     @staticmethod
     def _format_cover_address(address: Optional[str]) -> str:
-        """Format cover address on two lines like the mock (street then city/state)."""
+        """Prefix ADDRESS: and keep one flowing line; the wider box wraps if needed."""
         text = (address or "").strip()
         if not text:
             return ""
-        # Prefer split before city/state when ", ST ZIP" or ", City, ST" pattern exists
-        # e.g. "5700 Granite Pkwy, Frisco, TX 75034" -> street / "Frisco, TX 75034"
-        parts = [p.strip() for p in text.split(",") if p.strip()]
-        if len(parts) >= 3:
-            return f"{parts[0]},\n{', '.join(parts[1:])}"
-        if len(parts) == 2:
-            return f"{parts[0]},\n{parts[1]}"
-        # No commas — try last token that looks like a state abbrev
-        tokens = text.split()
-        if len(tokens) >= 3 and len(tokens[-2]) == 2 and tokens[-2].isalpha():
-            # "... Frisco TX 75034"
-            return f"{' '.join(tokens[:-3])} {tokens[-3]},\n{tokens[-2]} {tokens[-1]}"
-        return text
+        if text.upper().startswith("ADDRESS:"):
+            text = text.split(":", 1)[1].strip()
+        text = " ".join(text.split())
+        return f"ADDRESS: {text}"
 
     def _polish_cover_layout(
         self,
@@ -5709,6 +5724,7 @@ Rules:
                     self.COVER_ADDR_TOP_PT,
                     z=251680000,
                     height_pt=self.COVER_ADDR_HEIGHT_PT,
+                    width_pt=self.COVER_ADDR_WIDTH_PT,
                 )
                 pinned += 1
                 continue
@@ -5772,7 +5788,7 @@ Rules:
 
     @staticmethod
     def _cover_pin_body_slot(
-        drawing, h_rel, h_off_pt, v_rel, v_off_pt, z=None, height_pt=None
+        drawing, h_rel, h_off_pt, v_rel, v_off_pt, z=None, height_pt=None, width_pt=None
     ) -> None:
         """Pin a cover body shape (address / street photo) to the 2-column grid."""
         from lxml import etree
@@ -5797,12 +5813,13 @@ Rules:
             posV.set("relativeFrom", v_rel)
             off = etree.SubElement(posV, qn("wp:posOffset"))
             off.text = _emu(v_off_pt)
-        if height_pt is not None:
-            cy = str(int(round(height_pt * 12700)))
+        if height_pt is not None or width_pt is not None:
             a_ext = "{http://schemas.openxmlformats.org/drawingml/2006/main}ext"
             for ext in list(drawing.iter(qn("wp:extent"))) + list(drawing.iter(a_ext)):
-                if ext.get("cy") is not None:
-                    ext.set("cy", cy)
+                if height_pt is not None and ext.get("cy") is not None:
+                    ext.set("cy", str(int(round(height_pt * 12700))))
+                if width_pt is not None and ext.get("cx") is not None:
+                    ext.set("cx", str(int(round(width_pt * 12700))))
         anchor = next(
             (a for a in drawing if etree.QName(a).localname == "anchor"),
             None,
