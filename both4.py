@@ -6160,16 +6160,18 @@ Rules:
         )
         hero = Image.alpha_composite(base, overlay)
 
-        # Required: white shade on the LOWER building only (marked region).
-        # Apex = panel diagonal start; opens downward along the panel cut
-        # and down-right across the facade — not the upper-right sky triangle.
+        # Overlay follows the marked shape: panel diagonal → down-right across
+        # the facade → down the right edge → along the chevron (including the
+        # step). Not a rectangle through the chevron pocket.
         shade = Image.new("RGBA", (W, H), (0, 0, 0, 0))
         sd = ImageDraw.Draw(shade)
         sd.polygon(
             poly([
                 (446, 218),
-                (744, 380),
-                (744, 440),
+                (744, 365),
+                (744, 434),
+                (452, 434),
+                (428, 402),
                 (125, 402),
             ]),
             fill=(255, 255, 255, 95),
