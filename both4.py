@@ -3645,6 +3645,9 @@ Rules:
         # Keep a blank line above section titles (e.g. after General Information table)
         for heading in self.SECTION_HEADINGS_NEEDING_SPACE:
             self._ensure_blank_before_heading(doc, heading)
+        # Don't leave "Local Area Analysis" stranded at the bottom of a page
+        self._keep_heading_with_next(doc, "Local Area Analysis")
+        self._equalize_census_summary_tables(doc)
 
         # Force Aggressive = high, Market = exact (rounded), Conservative = low
         # by column label so scrambled template merges cannot swap them.
@@ -3698,6 +3701,12 @@ Rules:
             self._stamp_cover_hero_file(output_path, color_theme, property_data)
         except Exception as exc:
             logger.warning("Cover header stamp failed: %s", exc)
+
+        # Last: COM + stamp can restyle tables. Force opinions labels left/not-bold.
+        try:
+            self._patch_saved_document_tables(output_path)
+        except Exception as exc:
+            logger.warning("Post-COM table polish failed: %s", exc)
 
         return str(output_path)
 
@@ -4375,6 +4384,10 @@ Rules:
             word.Visible = False
             word.DisplayAlerts = 0
             doc = word.Documents.Open(FileName=path, AddToRecentFiles=False)
+            try:
+                self._word_keep_local_area_together(doc)
+            except Exception as laa_exc:
+                logger.warning("Local Area Analysis keep-together via Word COM failed: %s", laa_exc)
             # Force layout so page numbers are accurate
             doc.Repaginate()
 
@@ -5039,7 +5052,7 @@ Rules:
                 out.append(cell)
             return out
 
-        def _make_tc(text, span, bold=False, sz="20"):
+        def _make_tc(text, span, bold=False, sz="20", align="center"):
             tc = OxmlElement("w:tc")
             tcPr = OxmlElement("w:tcPr")
             tc.append(tcPr)
@@ -5058,7 +5071,7 @@ Rules:
                 el.set(qn("w:val"), "single")
                 el.set(qn("w:sz"), "4")
                 el.set(qn("w:space"), "0")
-                el.set(qn("w:color"), "000000")
+                el.set(qn("w:color"), "auto")
                 borders.append(el)
             vAlign = OxmlElement("w:vAlign")
             vAlign.set(qn("w:val"), "center")
@@ -5068,14 +5081,18 @@ Rules:
             pPr = OxmlElement("w:pPr")
             p.append(pPr)
             jc = OxmlElement("w:jc")
-            jc.set(qn("w:val"), "center")
+            jc.set(qn("w:val"), align)
             pPr.append(jc)
             r = OxmlElement("w:r")
             p.append(r)
             rPr = OxmlElement("w:rPr")
             r.append(rPr)
-            if bold:
-                rPr.append(OxmlElement("w:b"))
+            b = OxmlElement("w:b")
+            b.set(qn("w:val"), "1" if bold else "0")
+            rPr.append(b)
+            bCs = OxmlElement("w:bCs")
+            bCs.set(qn("w:val"), "1" if bold else "0")
+            rPr.append(bCs)
             for tag in ("sz", "szCs"):
                 el = OxmlElement(f"w:{tag}")
                 el.set(qn("w:val"), sz)
@@ -5173,12 +5190,12 @@ Rules:
                     rounded_text = (rounded_cells[-1].text or "").strip()
 
             price_tr = _make_tr([
-                _make_tc("Market Sale Price", label_span, bold=True, sz=sz),
+                _make_tc("Market Sale Price", label_span, bold=False, sz=sz, align="left"),
                 _make_tc(formula, mid_span, sz=sz),
                 _make_tc(value_text, val_span, sz=sz),
             ])
             rounded_tr = _make_tr([
-                _make_tc("Market Sales Price (Rounded)", label_span, bold=True, sz=sz),
+                _make_tc("Market Sales Price (Rounded)", label_span, bold=False, sz=sz, align="left"),
                 _make_tc("", mid_span, sz=sz),
                 _make_tc(rounded_text, val_span, sz=sz),
             ])
@@ -5197,10 +5214,10 @@ Rules:
             )
 
     def _align_valuation_and_opinions_table_widths(self, doc: Document) -> None:
-        """Make OPINIONS OF VALUE match VALUATION METHOD table width/right edge.
+        """Make OPINIONS OF VALUE use the same 3 column widths as VALUATION METHOD.
 
-        Prospect short-form left the opinions table on auto width, so Word
-        stretched it past the fixed valuation table above.
+        Visual columns (label | formula | value) must line up with
+        VALUATION METHOD | VALUE ESTIMATE | NOTES — not just the outer edge.
         """
         from docx.oxml import OxmlElement
         from docx.oxml.ns import qn
@@ -5209,6 +5226,81 @@ Rules:
             return " ".join(
                 (c.text or "") for row in table.rows for c in row.cells
             ).upper()
+
+        def _row_tcs(tr):
+            return list(tr.findall(qn("w:tc")))
+
+        def _span_of(tc) -> int:
+            tcPr = tc.find(qn("w:tcPr"))
+            if tcPr is None:
+                return 1
+            gs = tcPr.find(qn("w:gridSpan"))
+            if gs is None:
+                return 1
+            try:
+                return max(1, int(gs.get(qn("w:val")) or 1))
+            except ValueError:
+                return 1
+
+        def _grid_widths(table):
+            grid = table._tbl.find(qn("w:tblGrid"))
+            if grid is None:
+                return []
+            out = []
+            for col in grid.findall(qn("w:gridCol")):
+                try:
+                    out.append(int(col.get(qn("w:w")) or 0))
+                except ValueError:
+                    out.append(0)
+            return out
+
+        def _visual_widths(table):
+            grid_ws = _grid_widths(table)
+            tr = table._tbl.find(qn("w:tr"))
+            if tr is None:
+                return grid_ws
+            widths = []
+            gi = 0
+            for tc in _row_tcs(tr):
+                span = _span_of(tc)
+                tw = None
+                tcPr = tc.find(qn("w:tcPr"))
+                if tcPr is not None:
+                    tcW = tcPr.find(qn("w:tcW"))
+                    if tcW is not None and (tcW.get(qn("w:type")) or "dxa") == "dxa":
+                        try:
+                            tw = int(tcW.get(qn("w:w")) or 0)
+                        except ValueError:
+                            tw = None
+                if tw:
+                    widths.append(tw)
+                else:
+                    widths.append(sum(grid_ws[gi:gi + span]))
+                gi += span
+            return widths
+
+        def _distribute(total: int, n: int):
+            n = max(1, int(n))
+            total = max(n, int(total))
+            base, rem = divmod(total, n)
+            parts = [base] * n
+            for i in range(rem):
+                parts[n - 1 - i] += 1
+            drift = total - sum(parts)
+            parts[-1] += drift
+            return [max(1, p) for p in parts]
+
+        def _set_tc_width(tc, width: int) -> None:
+            tcPr = tc.find(qn("w:tcPr"))
+            if tcPr is None:
+                tcPr = OxmlElement("w:tcPr")
+                tc.insert(0, tcPr)
+            tcW = tcPr.find(qn("w:tcW"))
+            if tcW is None:
+                tcW = OxmlElement("w:tcW")
+                tcPr.insert(0, tcW)
+            tcW.set(qn("w:w"), str(max(1, int(width))))
+            tcW.set(qn("w:type"), "dxa")
 
         valuation = None
         opinions = None
@@ -5226,19 +5318,30 @@ Rules:
         if src_pr is None or dst_pr is None:
             return
 
+        vis = _visual_widths(valuation)
+        if len(vis) < 3:
+            return
+        col_w = [int(vis[0]), int(vis[1]), int(vis[2])]
+        target = sum(col_w)
+        wtype = "dxa"
+
         src_w = src_pr.find(qn("w:tblW"))
-        if src_w is None:
-            return
-        width = src_w.get(qn("w:w"))
-        wtype = src_w.get(qn("w:type")) or "dxa"
-        if not width:
-            return
+        if src_w is not None and src_w.get(qn("w:w")):
+            try:
+                target = int(src_w.get(qn("w:w")))
+                wtype = src_w.get(qn("w:type")) or "dxa"
+            except ValueError:
+                pass
+            if target != sum(col_w) and sum(col_w) > 0:
+                # Prefer the three visible column widths; keep their sum as table width
+                target = sum(col_w)
+                wtype = "dxa"
 
         dst_w = dst_pr.find(qn("w:tblW"))
         if dst_w is None:
             dst_w = OxmlElement("w:tblW")
             dst_pr.append(dst_w)
-        dst_w.set(qn("w:w"), width)
+        dst_w.set(qn("w:w"), str(target))
         dst_w.set(qn("w:type"), wtype)
 
         layout = dst_pr.find(qn("w:tblLayout"))
@@ -5247,12 +5350,6 @@ Rules:
             dst_pr.append(layout)
         layout.set(qn("w:type"), "fixed")
 
-        # Drop indent mismatch if present
-        for pr in (src_pr, dst_pr):
-            ind = pr.find(qn("w:tblInd"))
-            if ind is not None:
-                # Keep source indent on both so left edges match too
-                pass
         src_ind = src_pr.find(qn("w:tblInd"))
         dst_ind = dst_pr.find(qn("w:tblInd"))
         if src_ind is not None:
@@ -5266,29 +5363,77 @@ Rules:
         elif dst_ind is not None:
             dst_pr.remove(dst_ind)
 
-        # Scale destination grid columns to the valuation table total width
-        try:
-            target = int(width)
-        except ValueError:
-            return
         dst_grid = opinions._tbl.find(qn("w:tblGrid"))
-        if dst_grid is not None:
-            cols = list(dst_grid.findall(qn("w:gridCol")))
-            cur = sum(int(c.get(qn("w:w")) or 0) for c in cols)
-            if cols and cur > 0 and cur != target:
-                acc = 0
-                for i, col in enumerate(cols):
-                    if i == len(cols) - 1:
-                        new_w = max(1, target - acc)
-                    else:
-                        new_w = max(1, int(round(int(col.get(qn("w:w")) or 0) * target / cur)))
-                        acc += new_w
-                    col.set(qn("w:w"), str(new_w))
+        if dst_grid is None:
+            return
+        cols = list(dst_grid.findall(qn("w:gridCol")))
+        n_cols = len(cols)
+        if n_cols < 3:
+            return
+
+        # Visual grouping on the Market Sale Price row (3 columns after merge)
+        data_tr = None
+        for tr in opinions._tbl.findall(qn("w:tr")):
+            texts = []
+            for tc in _row_tcs(tr):
+                texts.append("".join(t.text or "" for t in tc.iter(qn("w:t"))))
+            if "MARKET SALE PRICE" in " ".join(texts).upper() and "ROUNDED" not in " ".join(texts).upper():
+                data_tr = tr
+                break
+        if data_tr is None:
+            trs = opinions._tbl.findall(qn("w:tr"))
+            data_tr = trs[1] if len(trs) > 1 else trs[0]
+
+        data_tcs = _row_tcs(data_tr)
+        data_spans = [_span_of(tc) for tc in data_tcs]
+        if len(data_tcs) == 5:
+            groups = [1, 3, 1]
+        elif len(data_spans) >= 3:
+            groups = [data_spans[0], data_spans[1], data_spans[2]]
+            # leftover grid columns stay on the last visual column
+            used = sum(groups)
+            if used < n_cols:
+                groups[2] += n_cols - used
+        elif n_cols == 3:
+            groups = [1, 1, 1]
+        elif n_cols >= 8:
+            groups = [2, n_cols - 4, 2]
+        else:
+            groups = [1, max(1, n_cols - 2), 1]
+
+        if sum(groups) != n_cols:
+            # Rebuild groups to fill the grid: first / last as given, rest in middle
+            left, right = groups[0], groups[-1]
+            mid = n_cols - left - right
+            if mid < 1:
+                groups = _distribute(n_cols, 3)
+            else:
+                groups = [left, mid, right]
+
+        new_ws = (
+            _distribute(col_w[0], groups[0])
+            + _distribute(col_w[1], groups[1])
+            + _distribute(col_w[2], groups[2])
+        )
+        if len(new_ws) != n_cols:
+            new_ws = _distribute(target, n_cols)
+        drift = target - sum(new_ws)
+        if new_ws:
+            new_ws[-1] += drift
+            new_ws[-1] = max(1, new_ws[-1])
+        for col, w in zip(cols, new_ws):
+            col.set(qn("w:w"), str(w))
+
+        for tr in opinions._tbl.findall(qn("w:tr")):
+            gi = 0
+            for tc in _row_tcs(tr):
+                span = _span_of(tc)
+                _set_tc_width(tc, sum(new_ws[gi:gi + span]))
+                gi += span
 
         logger.info(
-            "Aligned OPINIONS OF VALUE table width to VALUATION METHOD (%s %s)",
-            width,
-            wtype,
+            "Aligned OPINIONS OF VALUE columns to VALUATION METHOD %s",
+            col_w,
         )
 
     def _apply_sales_conclusion_grid_borders(self, doc: Document) -> None:
@@ -5303,9 +5448,9 @@ Rules:
                 el = OxmlElement(f"w:{tag}")
                 element.append(el)
             el.set(qn("w:val"), "single")
-            el.set(qn("w:sz"), "8")  # 1/8 pt units → 1pt
+            el.set(qn("w:sz"), "4")  # same 1/2 pt as Table Grid / VALUATION METHOD
             el.set(qn("w:space"), "0")
-            el.set(qn("w:color"), "000000")
+            el.set(qn("w:color"), "auto")
 
         def _grid_borders(container) -> None:
             for edge in ("top", "left", "bottom", "right", "insideH", "insideV"):
@@ -5325,33 +5470,403 @@ Rules:
             if tblPr is None:
                 tblPr = OxmlElement("w:tblPr")
                 table._tbl.insert(0, tblPr)
+            style = tblPr.find(qn("w:tblStyle"))
+            if style is not None:
+                # Table Grid first-column is bold+styled; drop it so labels
+                # stay regular weight / left like VALUATION METHOD body cells.
+                tblPr.remove(style)
+            look = tblPr.find(qn("w:tblLook"))
+            if look is None:
+                look = OxmlElement("w:tblLook")
+                tblPr.append(look)
+            look.set(qn("w:firstRow"), "1")
+            look.set(qn("w:lastRow"), "0")
+            look.set(qn("w:firstColumn"), "0")
+            look.set(qn("w:lastColumn"), "0")
+            look.set(qn("w:noHBand"), "1")
+            look.set(qn("w:noVBand"), "1")
+            look.set(qn("w:val"), "0400")
             borders = tblPr.find(qn("w:tblBorders"))
             if borders is None:
                 borders = OxmlElement("w:tblBorders")
                 tblPr.append(borders)
             else:
-                # Clear "none" borders left by the short-form template
+                # Clear "none" / thick borders left by the short-form template
                 for child in list(borders):
                     borders.remove(child)
             _grid_borders(borders)
 
-            # Also force per-cell borders so merged cells still draw a grid
+            # Drop per-cell borders so lines are not doubled (valuation uses
+            # Table Grid only — that is why the table above looks lighter).
             for row in table.rows:
                 for cell in row.cells:
-                    tcPr = cell._tc.get_or_add_tcPr()
+                    tcPr = cell._tc.find(qn("w:tcPr"))
+                    if tcPr is None:
+                        continue
                     tcBorders = tcPr.find(qn("w:tcBorders"))
-                    if tcBorders is None:
-                        tcBorders = OxmlElement("w:tcBorders")
-                        tcPr.append(tcBorders)
-                    else:
-                        for child in list(tcBorders):
-                            tcBorders.remove(child)
-                    for edge in ("top", "left", "bottom", "right"):
-                        _set_border(tcBorders, edge)
+                    if tcBorders is not None:
+                        tcPr.remove(tcBorders)
             touched += 1
 
         if touched:
             logger.info("Applied grid borders to %s sales-conclusion table(s)", touched)
+
+    def _patch_saved_document_tables(self, output_path) -> None:
+        """Disabled after Word COM.
+
+        Reserializing document.xml with lxml after COM (VML cover, namespaces)
+        produces packages Word reports as corrupt. Table/heading fixes run in
+        python-docx before save instead.
+        """
+        logger.info("Skipping post-COM XML table rewrite (avoids corrupt docx)")
+        return
+        xml_name = "word/document.xml"
+        if xml_name not in files:
+            return
+
+        root = etree.fromstring(files[xml_name])
+
+        def _tbl_text(tbl) -> str:
+            return " ".join((t.text or "") for t in tbl.iter(qn("w:t"))).upper()
+
+        def _ensure(parent, tag):
+            el = parent.find(tag)
+            if el is None:
+                el = etree.SubElement(parent, tag)
+            return el
+
+        def _set_b_off(rPr) -> None:
+            for tag in (qn("w:b"), qn("w:bCs")):
+                el = rPr.find(tag)
+                if el is None:
+                    el = etree.SubElement(rPr, tag)
+                el.set(qn("w:val"), "0")
+
+        def _left_unbold_tc(tc) -> None:
+            """Replace cell content with one left-aligned, not-bold paragraph."""
+            text = "".join(t.text or "" for t in tc.iter(qn("w:t")))
+            sz = "20"
+            for rPr in tc.iter(qn("w:rPr")):
+                s = rPr.find(qn("w:sz"))
+                if s is not None and s.get(qn("w:val")):
+                    sz = s.get(qn("w:val"))
+                    break
+            for child in list(tc):
+                if child.tag != qn("w:tcPr"):
+                    tc.remove(child)
+            p = etree.SubElement(tc, qn("w:p"))
+            pPr = etree.SubElement(p, qn("w:pPr"))
+            jc = etree.SubElement(pPr, qn("w:jc"))
+            jc.set(qn("w:val"), "left")
+            p_rPr = etree.SubElement(pPr, qn("w:rPr"))
+            r = etree.SubElement(p, qn("w:r"))
+            rPr = etree.SubElement(r, qn("w:rPr"))
+            for rPr_el in (p_rPr, rPr):
+                for tag in (qn("w:b"), qn("w:bCs")):
+                    el = etree.SubElement(rPr_el, tag)
+                    el.set(qn("w:val"), "0")
+                for tag in (qn("w:sz"), qn("w:szCs")):
+                    el = etree.SubElement(rPr_el, tag)
+                    el.set(qn("w:val"), sz)
+            t = etree.SubElement(r, qn("w:t"))
+            t.text = text
+            t.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
+
+        def _set_tbl_look(tblPr, first_col: str) -> None:
+            look = _ensure(tblPr, qn("w:tblLook"))
+            look.set(qn("w:firstRow"), "1")
+            look.set(qn("w:lastRow"), "0")
+            look.set(qn("w:firstColumn"), first_col)
+            look.set(qn("w:lastColumn"), "0")
+            look.set(qn("w:noHBand"), "1")
+            look.set(qn("w:noVBand"), "1")
+            look.set(qn("w:val"), "0400" if first_col == "0" else "04A0")
+
+        def _cap_borders(container, sz="4") -> None:
+            if container is None:
+                return
+            for ch in list(container):
+                val = ch.get(qn("w:val"))
+                if val in (None, "nil", "none"):
+                    continue
+                ch.set(qn("w:sz"), sz)
+                ch.set(qn("w:val"), "single")
+
+        def _nil_lr(tc) -> None:
+            tcPr = tc.find(qn("w:tcPr"))
+            if tcPr is None:
+                tcPr = etree.Element(qn("w:tcPr"))
+                tc.insert(0, tcPr)
+            borders = _ensure(tcPr, qn("w:tcBorders"))
+            for edge in ("left", "right"):
+                el = _ensure(borders, qn(f"w:{edge}"))
+                el.set(qn("w:val"), "nil")
+                el.set(qn("w:sz"), "0")
+                el.set(qn("w:space"), "0")
+                el.set(qn("w:color"), "auto")
+
+        def _strip_cell_borders(tbl) -> None:
+            for tc in tbl.iter(qn("w:tc")):
+                tcPr = tc.find(qn("w:tcPr"))
+                if tcPr is None:
+                    continue
+                tb = tcPr.find(qn("w:tcBorders"))
+                if tb is not None:
+                    tcPr.remove(tb)
+
+        changed = []
+        for tbl in root.iter(qn("w:tbl")):
+            text = _tbl_text(tbl)
+            tblPr = tbl.find(qn("w:tblPr"))
+            if tblPr is None:
+                continue
+
+            # --- Sales Conclusion / OPINIONS OF VALUE ---
+            if "OPINIONS OF VALUE" in text and "MARKET SALE PRICE" in text:
+                if "SUMMARY OF STRENGTHS" in text:
+                    continue
+                style = tblPr.find(qn("w:tblStyle"))
+                if style is not None:
+                    tblPr.remove(style)
+                _set_tbl_look(tblPr, "0")
+                _cap_borders(tblPr.find(qn("w:tblBorders")))
+                _strip_cell_borders(tbl)
+                for tr in tbl.findall(qn("w:tr")):
+                    tcs = tr.findall(qn("w:tc"))
+                    if not tcs:
+                        continue
+                    label = " ".join(
+                        (t.text or "") for t in tcs[0].iter(qn("w:t"))
+                    ).upper()
+                    if "MARKET SALE" in label:
+                        _left_unbold_tc(tcs[0])
+                changed.append("opinions")
+                continue
+
+            # --- LOCAL AREA DEMOGRAPHICS ---
+            if "LOCAL AREA DEMOGRAPHICS" in text:
+                _cap_borders(tblPr.find(qn("w:tblBorders")))
+                _strip_cell_borders(tbl)
+                grid = tbl.find(qn("w:tblGrid"))
+                gutter_idx = None
+                cols = []
+                if grid is not None:
+                    cols = grid.findall(qn("w:gridCol"))
+                    for i, col in enumerate(cols):
+                        try:
+                            w = int(col.get(qn("w:w")) or 0)
+                        except ValueError:
+                            w = 0
+                        if 200 <= w <= 500 and 0 < i < len(cols) - 1:
+                            gutter_idx = i
+                            break
+                    # Equal 1 / 3 / 5 mile columns in each pane so the 3-mile
+                    # right edge is not a different weight than 1-mile.
+                    if len(cols) >= 9:
+                        def _avg3(idxs):
+                            total = 0
+                            for i in idxs:
+                                try:
+                                    total += int(cols[i].get(qn("w:w")) or 0)
+                                except ValueError:
+                                    pass
+                            base, rem = divmod(total, 3)
+                            return [base + (1 if i >= 3 - rem else 0) for i in range(3)]
+
+                        left = _avg3((1, 2, 3))
+                        right = _avg3((6, 7, 8))
+                        for i, w in zip((1, 2, 3), left):
+                            cols[i].set(qn("w:w"), str(max(1, w)))
+                        for i, w in zip((6, 7, 8), right):
+                            cols[i].set(qn("w:w"), str(max(1, w)))
+                grid_ws = []
+                for col in cols:
+                    try:
+                        grid_ws.append(int(col.get(qn("w:w")) or 0))
+                    except ValueError:
+                        grid_ws.append(0)
+
+                def _nil_edge(tc, edge: str) -> None:
+                    tcPr = tc.find(qn("w:tcPr"))
+                    if tcPr is None:
+                        tcPr = etree.Element(qn("w:tcPr"))
+                        tc.insert(0, tcPr)
+                    borders = _ensure(tcPr, qn("w:tcBorders"))
+                    el = _ensure(borders, qn(f"w:{edge}"))
+                    el.set(qn("w:val"), "nil")
+                    el.set(qn("w:sz"), "0")
+                    el.set(qn("w:space"), "0")
+                    el.set(qn("w:color"), "auto")
+
+                for tr in tbl.findall(qn("w:tr")):
+                    gi = 0
+                    row_cells = []
+                    for tc in tr.findall(qn("w:tc")):
+                        tcPr = tc.find(qn("w:tcPr"))
+                        span = 1
+                        if tcPr is not None:
+                            gs = tcPr.find(qn("w:gridSpan"))
+                            if gs is not None:
+                                try:
+                                    span = max(1, int(gs.get(qn("w:val")) or 1))
+                                except ValueError:
+                                    span = 1
+                            tcW = tcPr.find(qn("w:tcW"))
+                            if tcW is not None and gi + span <= len(grid_ws):
+                                tcW.set(qn("w:w"), str(sum(grid_ws[gi:gi + span])))
+                                tcW.set(qn("w:type"), "dxa")
+                        if gutter_idx is not None and gi == gutter_idx:
+                            _nil_lr(tc)
+                        row_cells.append((tc, gi, span))
+                        gi += span
+                    # Section titles span Description+1 mile, leaving empty
+                    # 3-mile and 5-mile cells whose shared edge looks bold.
+                    for tc, gi, span in row_cells:
+                        if span != 2 or gi not in (0, 5):
+                            continue
+                        three = five = None
+                        for other, ogi, osp in row_cells:
+                            if ogi == gi + 2 and osp == 1:
+                                three = other
+                            if ogi == gi + 3 and osp == 1:
+                                five = other
+                        if three is not None:
+                            _nil_edge(three, "right")
+                        if five is not None:
+                            _nil_edge(five, "left")
+                changed.append("demographics")
+                continue
+
+            # --- IMPROVEMENT / SITE / GENERAL INFORMATION ---
+            if "IMPROVEMENT INFORMATION" in text:
+                _cap_borders(tblPr.find(qn("w:tblBorders")))
+                _strip_cell_borders(tbl)
+                for p in tbl.iter(qn("w:p")):
+                    pPr = p.find(qn("w:pPr"))
+                    if pPr is None:
+                        continue
+                    pBdr = pPr.find(qn("w:pBdr"))
+                    if pBdr is not None:
+                        pPr.remove(pBdr)
+                changed.append("improvement")
+                continue
+
+            # --- POPULATION / DENSITY / HOUSEHOLDS / SIZE / HOUSING UNITS ---
+            first_tr = tbl.find(qn("w:tr"))
+            first_title = ""
+            if first_tr is not None:
+                first_title = " ".join(
+                    (t.text or "") for t in first_tr.iter(qn("w:t"))
+                ).strip().upper()
+            census_titles = {
+                "POPULATION",
+                "POPULATION DENSITY",
+                "NUMBER OF HOUSEHOLDS",
+                "AVERAGE HOUSEHOLD SIZE",
+                "HOUSING UNITS",
+            }
+            trs = tbl.findall(qn("w:tr"))
+            row0 = row1 = ""
+            if trs:
+                row0 = " ".join((t.text or "") for t in trs[0].iter(qn("w:t"))).strip().upper()
+            if len(trs) > 1:
+                row1 = " ".join((t.text or "") for t in trs[1].iter(qn("w:t"))).strip().upper()
+            is_census = (
+                row0 in census_titles
+                and "LOCAL AREA" not in row0
+                and "U.S." in (row1 + " " + text)
+                and "COUNTY" in (row1 + " " + text)
+            )
+            if is_census:
+                layout = _ensure(tblPr, qn("w:tblLayout"))
+                layout.set(qn("w:type"), "fixed")
+                total = 9360
+                col_w = 2340
+                tblW = _ensure(tblPr, qn("w:tblW"))
+                tblW.set(qn("w:w"), str(total))
+                tblW.set(qn("w:type"), "dxa")
+                grid = tbl.find(qn("w:tblGrid"))
+                if grid is not None:
+                    cols = grid.findall(qn("w:gridCol"))
+                    while len(cols) < 4:
+                        el = etree.SubElement(grid, qn("w:gridCol"))
+                        cols.append(el)
+                    for i, col in enumerate(cols[:4]):
+                        col.set(qn("w:w"), str(col_w))
+                    for extra in cols[4:]:
+                        grid.remove(extra)
+                for tr in tbl.findall(qn("w:tr")):
+                    gi = 0
+                    for tc in tr.findall(qn("w:tc")):
+                        tcPr = tc.find(qn("w:tcPr"))
+                        if tcPr is None:
+                            tcPr = etree.Element(qn("w:tcPr"))
+                            tc.insert(0, tcPr)
+                        span = 1
+                        gs = tcPr.find(qn("w:gridSpan"))
+                        if gs is not None:
+                            try:
+                                span = max(1, int(gs.get(qn("w:val")) or 1))
+                            except ValueError:
+                                span = 1
+                        tcW = _ensure(tcPr, qn("w:tcW"))
+                        tcW.set(qn("w:w"), str(col_w * span))
+                        tcW.set(qn("w:type"), "dxa")
+                        gi += span
+                _cap_borders(tblPr.find(qn("w:tblBorders")))
+                _strip_cell_borders(tbl)
+                changed.append(first_title.lower())
+                continue
+
+        # Keep "Local Area Analysis" with the following paragraph
+        for p in root.iter(qn("w:p")):
+            txt = "".join((t.text or "") for t in p.iter(qn("w:t"))).strip()
+            if not txt.lower().startswith("local area analysis"):
+                continue
+            pPr = p.find(qn("w:pPr"))
+            if pPr is None:
+                pPr = etree.Element(qn("w:pPr"))
+                p.insert(0, pPr)
+            if pPr.find(qn("w:keepNext")) is None:
+                etree.SubElement(pPr, qn("w:keepNext"))
+            if pPr.find(qn("w:keepLines")) is None:
+                etree.SubElement(pPr, qn("w:keepLines"))
+            if pPr.find(qn("w:pageBreakBefore")) is None:
+                etree.SubElement(pPr, qn("w:pageBreakBefore"))
+            nxt = p.getnext()
+            hops = 0
+            while nxt is not None and hops < 4:
+                if nxt.tag == qn("w:p"):
+                    nPr = _ensure(nxt, qn("w:pPr"))
+                    if nPr.find(qn("w:keepNext")) is None:
+                        etree.SubElement(nPr, qn("w:keepNext"))
+                    ntxt = "".join((t.text or "") for t in nxt.iter(qn("w:t"))).strip()
+                    if ntxt:
+                        break
+                elif nxt.tag == qn("w:tbl"):
+                    break
+                nxt = nxt.getnext()
+                hops += 1
+            changed.append("local-area-heading")
+            break
+
+        if not changed:
+            return
+
+        xml_out = etree.tostring(
+            root, xml_declaration=True, encoding="UTF-8", standalone=True
+        )
+
+        def _transform(name, data):
+            if name.replace("\\", "/") == "word/document.xml":
+                return xml_out
+            return data
+
+        try:
+            self._rewrite_docx_preserving_zip(path, _transform)
+            logger.info("Post-COM table polish (%s) applied to %s", ",".join(changed), path)
+        except Exception as exc:
+            logger.warning("Post-COM table polish write failed: %s", exc)
 
     def _sync_sale_opinion_typography(self, doc: Document) -> None:
         """Match SALE OPINION OF VALUE font size and row height to OPINIONS rows.
@@ -5501,6 +6016,36 @@ Rules:
                 pPr.append(jc)
             jc.set(qn("w:val"), "center")
 
+        def _left_plain(cell) -> None:
+            """First-column labels: left aligned, not bold."""
+            for p in cell.paragraphs:
+                p.alignment = WD_ALIGN_PARAGRAPH.LEFT
+                pPr = p._element.get_or_add_pPr()
+                jc = pPr.find(qn("w:jc"))
+                if jc is None:
+                    jc = OxmlElement("w:jc")
+                    pPr.append(jc)
+                jc.set(qn("w:val"), "left")
+                rPr = pPr.find(qn("w:rPr"))
+                if rPr is None:
+                    rPr = OxmlElement("w:rPr")
+                    pPr.append(rPr)
+                for tag in ("b", "bCs"):
+                    el = rPr.find(qn(f"w:{tag}"))
+                    if el is None:
+                        el = OxmlElement(f"w:{tag}")
+                        rPr.append(el)
+                    el.set(qn("w:val"), "0")
+                for run in p.runs:
+                    run.bold = False
+                    rr = run._r.get_or_add_rPr()
+                    for tag in ("b", "bCs"):
+                        el = rr.find(qn(f"w:{tag}"))
+                        if el is None:
+                            el = OxmlElement(f"w:{tag}")
+                            rr.append(el)
+                        el.set(qn("w:val"), "0")
+
         centered = 0
         for table in doc.tables:
             flat = " ".join(
@@ -5513,14 +6058,19 @@ Rules:
             for row in table.rows:
                 row_text = " ".join((c.text or "") for c in row.cells).upper()
                 if "MARKET SALE" in row_text or "SALE OPINION" in row_text:
+                    seen = set()
+                    first = True
                     for cell in row.cells:
-                        label = (cell.text or "").strip().upper()
-                        # Keep left labels; center values / header band
-                        if label in {
-                            "MARKET SALE PRICE",
-                            "MARKET SALES PRICE (ROUNDED)",
-                        }:
+                        if id(cell._tc) in seen:
                             continue
+                        seen.add(id(cell._tc))
+                        label = " ".join((cell.text or "").split()).upper()
+                        # First col only: left + regular weight
+                        if first and "MARKET SALE" in label:
+                            _left_plain(cell)
+                            first = False
+                            continue
+                        first = False
                         for p in cell.paragraphs:
                             _center_para(p)
                             centered += 1
@@ -5544,6 +6094,266 @@ Rules:
 
         if centered:
             logger.info("Centered %s SALE OPINION OF VALUE paragraph(s)", centered)
+
+    def _keep_heading_with_next(self, doc: Document, heading: str) -> None:
+        """Keep `heading` with the following body on one page, starting a new page.
+
+        keepNext and a merged soft-break paragraph still split in Word/PDF.
+        Wrap title + Esri paragraph in a borderless row that cannot split, and
+        page-break before it so they start together at the top of the page.
+        """
+        from docx.oxml import OxmlElement
+        from docx.oxml.ns import qn
+
+        paras = list(doc.paragraphs)
+        idx = None
+        for i, paragraph in enumerate(paras):
+            if paragraph.text.strip().lower().startswith(heading.lower()):
+                idx = i
+                break
+        if idx is None:
+            return
+
+        heading_p = paras[idx]
+        blob = heading_p.text.lower()
+        already_joined = "esri reports" in blob or "within 1" in blob
+
+        body_p = None
+        empty_between = []
+        if not already_joined:
+            for paragraph in paras[idx + 1 : idx + 8]:
+                if not (paragraph.text or "").strip():
+                    empty_between.append(paragraph)
+                    continue
+                body_p = paragraph
+                break
+            if body_p is None:
+                return
+            for paragraph in empty_between:
+                parent = paragraph._p.getparent()
+                if parent is not None:
+                    parent.remove(paragraph._p)
+
+        def _nil_border(tag: str):
+            el = OxmlElement(tag)
+            el.set(qn("w:val"), "nil")
+            el.set(qn("w:sz"), "0")
+            el.set(qn("w:space"), "0")
+            el.set(qn("w:color"), "auto")
+            return el
+
+        tbl = OxmlElement("w:tbl")
+        tblPr = OxmlElement("w:tblPr")
+        tblW = OxmlElement("w:tblW")
+        tblW.set(qn("w:w"), "0")
+        tblW.set(qn("w:type"), "auto")
+        tblPr.append(tblW)
+        borders = OxmlElement("w:tblBorders")
+        for edge in ("top", "left", "bottom", "right", "insideH", "insideV"):
+            borders.append(_nil_border(f"w:{edge}"))
+        tblPr.append(borders)
+        mar = OxmlElement("w:tblCellMar")
+        for side in ("top", "left", "bottom", "right"):
+            el = OxmlElement(f"w:{side}")
+            el.set(qn("w:w"), "0")
+            el.set(qn("w:type"), "dxa")
+            mar.append(el)
+        tblPr.append(mar)
+        tbl.append(tblPr)
+
+        grid = OxmlElement("w:tblGrid")
+        grid_col = OxmlElement("w:gridCol")
+        grid_col.set(qn("w:w"), "9360")
+        grid.append(grid_col)
+        tbl.append(grid)
+
+        tr = OxmlElement("w:tr")
+        trPr = OxmlElement("w:trPr")
+        trPr.append(OxmlElement("w:cantSplit"))
+        tr.append(trPr)
+        tc = OxmlElement("w:tc")
+        tcPr = OxmlElement("w:tcPr")
+        tcW = OxmlElement("w:tcW")
+        tcW.set(qn("w:w"), "9360")
+        tcW.set(qn("w:type"), "dxa")
+        tcPr.append(tcW)
+        tc.append(tcPr)
+
+        heading_el = heading_p._p
+        heading_el.addprevious(tbl)
+
+        pb_p = OxmlElement("w:p")
+        pb_pPr = OxmlElement("w:pPr")
+        pb_pPr.append(OxmlElement("w:pageBreakBefore"))
+        sp = OxmlElement("w:spacing")
+        sp.set(qn("w:before"), "0")
+        sp.set(qn("w:after"), "0")
+        pb_pPr.append(sp)
+        pb_p.append(pb_pPr)
+        tbl.addprevious(pb_p)
+
+        h_pPr = heading_el.get_or_add_pPr()
+        if h_pPr.find(qn("w:keepNext")) is None:
+            h_pPr.append(OxmlElement("w:keepNext"))
+        pb = h_pPr.find(qn("w:pageBreakBefore"))
+        if pb is not None:
+            h_pPr.remove(pb)
+        tc.append(heading_el)
+        if body_p is not None:
+            b_pPr = body_p._p.get_or_add_pPr()
+            kn = b_pPr.find(qn("w:keepNext"))
+            if kn is not None:
+                b_pPr.remove(kn)
+            pb = b_pPr.find(qn("w:pageBreakBefore"))
+            if pb is not None:
+                b_pPr.remove(pb)
+            tc.append(body_p._p)
+        tr.append(tc)
+        tbl.append(tr)
+        logger.info("Wrapped %r with body in an unsplittable block", heading)
+
+    def _word_keep_local_area_together(self, doc) -> None:
+        """Word COM: start Local Area Analysis on a new page with its body.
+
+        Deletes the paragraph mark after the title so title + Esri text cannot
+        land on different pages. Also blocks the row from breaking if wrapped.
+        """
+        wd_character = 1
+
+        heading_p = None
+        for i in range(1, int(doc.Paragraphs.Count) + 1):
+            p = doc.Paragraphs(i)
+            raw = (p.Range.Text or "").replace("\r", "").replace("\x07", "").strip()
+            if raw.lower().startswith("local area analysis"):
+                heading_p = p
+                heading_text = raw
+                break
+        if heading_p is None:
+            return
+
+        in_table = False
+        try:
+            heading_p.Range.Tables(1).Rows(1).AllowBreakAcrossPages = False
+            in_table = True
+        except Exception:
+            pass
+
+        heading_p.Range.ParagraphFormat.PageBreakBefore = not in_table
+        heading_p.Range.ParagraphFormat.KeepWithNext = True
+        heading_p.Range.ParagraphFormat.KeepTogether = True
+
+        if "esri reports" in heading_text.lower() or "within 1" in heading_text.lower():
+            logger.info("Word COM: Local Area Analysis already includes body")
+            return
+
+        nxt = heading_p.Next
+        hops = 0
+        while nxt is not None and hops < 6:
+            nt = (nxt.Range.Text or "").replace("\r", "").replace("\x07", "").strip()
+            if nt:
+                break
+            following = nxt.Next
+            nxt.Range.Delete()
+            nxt = following
+            hops += 1
+        if nxt is None:
+            return
+        nt = (nxt.Range.Text or "").replace("\r", "").replace("\x07", "").strip()
+        if not (nt.lower().startswith("within") or "esri reports" in nt.lower()):
+            return
+
+        nxt.Range.ParagraphFormat.PageBreakBefore = False
+        nxt.Range.ParagraphFormat.KeepWithNext = False
+
+        rng = heading_p.Range
+        rng.MoveEnd(wd_character, -1)
+        rng.InsertAfter("\x0b")
+        heading_p.Range.Characters.Last.Delete()
+        heading_p.Range.ParagraphFormat.PageBreakBefore = not in_table
+        heading_p.Range.ParagraphFormat.KeepTogether = True
+        heading_p.Range.ParagraphFormat.KeepWithNext = False
+        heading_p.Range.ParagraphFormat.Alignment = 0  # left, not justified
+        logger.info("Word COM: joined Local Area Analysis with following paragraph")
+
+    def _equalize_census_summary_tables(self, doc: Document) -> None:
+        """Force POPULATION / DENSITY / HH / SIZE / HOUSING UNITS to 4 equal columns.
+
+        Word COM autofit was stretching YEAR vs U.S. / STATE / COUNTY differently
+        in each table.
+        """
+        from docx.oxml import OxmlElement
+        from docx.oxml.ns import qn
+
+        titles = {
+            "POPULATION",
+            "POPULATION DENSITY",
+            "NUMBER OF HOUSEHOLDS",
+            "AVERAGE HOUSEHOLD SIZE",
+            "HOUSING UNITS",
+        }
+        col_w = 2340
+        total = col_w * 4
+        touched = 0
+        for table in doc.tables:
+            if not table.rows:
+                continue
+            title = " ".join((table.rows[0].cells[0].text or "").split()).strip().upper()
+            blob = " ".join(
+                (c.text or "") for row in table.rows[:3] for c in row.cells
+            ).upper()
+            if title not in titles or "U.S." not in blob or "COUNTY" not in blob:
+                continue
+            if "LOCAL AREA" in title:
+                continue
+            tblPr = table._tbl.tblPr
+            if tblPr is None:
+                continue
+            layout = tblPr.find(qn("w:tblLayout"))
+            if layout is None:
+                layout = OxmlElement("w:tblLayout")
+                tblPr.append(layout)
+            layout.set(qn("w:type"), "fixed")
+            tblW = tblPr.find(qn("w:tblW"))
+            if tblW is None:
+                tblW = OxmlElement("w:tblW")
+                tblPr.append(tblW)
+            tblW.set(qn("w:w"), str(total))
+            tblW.set(qn("w:type"), "dxa")
+            grid = table._tbl.find(qn("w:tblGrid"))
+            if grid is not None:
+                cols = list(grid.findall(qn("w:gridCol")))
+                while len(cols) < 4:
+                    gc = OxmlElement("w:gridCol")
+                    grid.append(gc)
+                    cols.append(gc)
+                for col in cols[:4]:
+                    col.set(qn("w:w"), str(col_w))
+                for extra in cols[4:]:
+                    grid.remove(extra)
+            for tr in table._tbl.findall(qn("w:tr")):
+                gi = 0
+                for tc in tr.findall(qn("w:tc")):
+                    tcPr = tc.find(qn("w:tcPr"))
+                    if tcPr is None:
+                        tcPr = OxmlElement("w:tcPr")
+                        tc.insert(0, tcPr)
+                    span = 1
+                    gs = tcPr.find(qn("w:gridSpan"))
+                    if gs is not None:
+                        try:
+                            span = max(1, int(gs.get(qn("w:val")) or 1))
+                        except ValueError:
+                            span = 1
+                    tcW = tcPr.find(qn("w:tcW"))
+                    if tcW is None:
+                        tcW = OxmlElement("w:tcW")
+                        tcPr.insert(0, tcW)
+                    tcW.set(qn("w:w"), str(col_w * span))
+                    tcW.set(qn("w:type"), "dxa")
+                    gi += span
+            touched += 1
+        if touched:
+            logger.info("Equalized %s census summary table(s) to 4x%s dxa", touched, col_w)
 
     def _ensure_page_break_before_heading(self, doc: Document, heading: str) -> None:
         """Insert a page break immediately before `heading` if one is missing.
@@ -6366,12 +7176,12 @@ Rules:
     @staticmethod
     def _rewrite_docx_preserving_zip(path, transform) -> None:
         import zipfile
-        import tempfile
         import os as _os
 
         path = Path(path)
-        tmp_fd, tmp_path = tempfile.mkstemp(suffix=".docx")
-        _os.close(tmp_fd)
+        # Same-directory temp: os.replace across C: → D: raises WinError 17
+        # and silently leaves the unpatched report in place.
+        tmp_path = path.parent / (path.stem + ".__rewr__.docx")
         try:
             with zipfile.ZipFile(path, "r") as zin, zipfile.ZipFile(tmp_path, "w") as zout:
                 for item in zin.infolist():
@@ -6385,10 +7195,10 @@ Rules:
                     info.external_attr = item.external_attr
                     info.create_system = item.create_system
                     zout.writestr(info, data)
-            _os.replace(tmp_path, path)
+            _os.replace(str(tmp_path), str(path))
         except Exception:
             try:
-                _os.unlink(tmp_path)
+                tmp_path.unlink()
             except Exception:
                 pass
             raise
