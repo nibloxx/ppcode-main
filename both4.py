@@ -2598,7 +2598,7 @@ Rules:
             page_images.append(image_path)
 
         if page_images:
-            for image_path in page_images:
+            for img_idx, image_path in enumerate(page_images):
                 img_p = self._insert_paragraph_after(anchor)
                 img_p.paragraph_format.space_before = Pt(0)
                 img_p.paragraph_format.space_after = Pt(2)
@@ -2610,12 +2610,22 @@ Rules:
                         max_edge=900 if is_prospect else 1400,
                         quality=52 if is_prospect else 72,
                     )
-                    width_in, _height_in = self._comp_image_display_size(
+                    width_in, height_in = self._comp_image_display_size(
                         compressed, pack_tight=is_prospect
                     )
-                    # Width drives size (aspect kept). Sizing packs ~2 short
-                    # CoStar pages per Word page; tall 2-card sheets stay 1/page.
-                    img_p.add_run().add_picture(compressed, width=Inches(width_in))
+                    # First sheet shares the page with PROPERTY COMPARABLES.
+                    if img_idx == 0:
+                        max_first_h = 7.15 if is_prospect else 7.35
+                        if height_in > max_first_h:
+                            img_p.add_run().add_picture(
+                                compressed, height=Inches(max_first_h)
+                            )
+                        else:
+                            img_p.add_run().add_picture(
+                                compressed, width=Inches(width_in)
+                            )
+                    else:
+                        img_p.add_run().add_picture(compressed, width=Inches(width_in))
                     anchor = img_p
                 except Exception as exc:
                     logger.warning("Could not insert comp page image: %s", exc)
@@ -3647,6 +3657,9 @@ Rules:
             self._ensure_blank_before_heading(doc, heading)
         # Don't leave "Local Area Analysis" stranded at the bottom of a page
         self._keep_heading_with_next(doc, "Local Area Analysis")
+        # PROPERTY COMPARABLES heading was ending a section, so comps started
+        # on the next page alone — keep the title with the first sheet.
+        self._keep_comparables_heading_with_content(doc)
         self._equalize_census_summary_tables(doc)
 
         # Force Aggressive = high, Market = exact (rounded), Conservative = low
@@ -6094,6 +6107,168 @@ Rules:
 
         if centered:
             logger.info("Centered %s SALE OPINION OF VALUE paragraph(s)", centered)
+
+    def _keep_comparables_heading_with_content(self, doc: Document) -> None:
+        """Keep PROPERTY COMPARABLES on the same page as the first comps sheet.
+
+        The template puts sectPr on that heading, so Word treats the title as
+        the last paragraph of the previous section and starts the CoStar pages
+        in a new section on the next page.
+        """
+        from docx.oxml import OxmlElement
+        from docx.oxml.ns import qn
+
+        heading_p = None
+        for paragraph in doc.paragraphs:
+            if "PROPERTY COMPARABLES" in (paragraph.text or "").upper():
+                heading_p = paragraph
+                break
+        if heading_p is None:
+            return
+
+        heading_el = heading_p._p
+        pPr = heading_el.get_or_add_pPr()
+        sect = pPr.find(qn("w:sectPr"))
+        if sect is not None:
+            pPr.remove(sect)
+            prev = heading_el.getprevious()
+            prev_is_empty_p = False
+            if prev is not None and prev.tag == qn("w:p"):
+                prev_text = "".join(t.text or "" for t in prev.iter(qn("w:t"))).strip()
+                prev_has_drawing = any(True for _ in prev.iter(qn("w:drawing")))
+                prev_pPr = prev.find(qn("w:pPr"))
+                prev_has_sect = (
+                    prev_pPr is not None and prev_pPr.find(qn("w:sectPr")) is not None
+                )
+                prev_is_empty_p = (
+                    not prev_text and not prev_has_drawing and not prev_has_sect
+                )
+            if not prev_is_empty_p:
+                new_p = OxmlElement("w:p")
+                heading_el.addprevious(new_p)
+                prev = new_p
+            prev_pPr = prev.find(qn("w:pPr"))
+            if prev_pPr is None:
+                prev_pPr = OxmlElement("w:pPr")
+                prev.insert(0, prev_pPr)
+            if prev_pPr.find(qn("w:sectPr")) is None:
+                prev_pPr.append(sect)
+            logger.info("Moved PROPERTY COMPARABLES section break before the heading")
+
+        pb = pPr.find(qn("w:pageBreakBefore"))
+        if pb is not None:
+            pPr.remove(pb)
+        for br in list(heading_el.iter(qn("w:br"))):
+            if br.get(qn("w:type")) == "page":
+                parent = br.getparent()
+                if parent is not None:
+                    parent.remove(br)
+        if pPr.find(qn("w:keepNext")) is None:
+            pPr.append(OxmlElement("w:keepNext"))
+
+        first_img = None
+        empty_between = []
+        nxt = heading_el.getnext()
+        hops = 0
+        while nxt is not None and hops < 8:
+            if nxt.tag == qn("w:tbl"):
+                break
+            if nxt.tag == qn("w:p"):
+                ntxt = "".join(t.text or "" for t in nxt.iter(qn("w:t"))).strip()
+                if ntxt.upper().startswith("RECONCILIATION"):
+                    break
+                has_drawing = any(True for _ in nxt.iter(qn("w:drawing")))
+                if has_drawing:
+                    first_img = nxt
+                    break
+                if not ntxt:
+                    empty_between.append(nxt)
+            nxt = nxt.getnext()
+            hops += 1
+
+        for empty in empty_between:
+            parent = empty.getparent()
+            if parent is not None:
+                parent.remove(empty)
+
+        if first_img is None:
+            return
+
+        # Cap first-sheet height so the heading fits above it on one page.
+        max_cy = int(7.35 * 914400)
+        wp_ext = "{http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing}extent"
+        a_ext = "{http://schemas.openxmlformats.org/drawingml/2006/main}ext"
+        for ext in list(first_img.iter(wp_ext)) + list(first_img.iter(a_ext)):
+            try:
+                cx = int(ext.get("cx") or 0)
+                cy = int(ext.get("cy") or 0)
+            except ValueError:
+                continue
+            if cy > max_cy and cy:
+                scale = max_cy / cy
+                ext.set("cx", str(int(cx * scale)))
+                ext.set("cy", str(max_cy))
+
+        img_pPr = first_img.find(qn("w:pPr"))
+        if img_pPr is not None:
+            pb = img_pPr.find(qn("w:pageBreakBefore"))
+            if pb is not None:
+                img_pPr.remove(pb)
+        for br in list(first_img.iter(qn("w:br"))):
+            if br.get(qn("w:type")) == "page":
+                parent = br.getparent()
+                if parent is not None:
+                    parent.remove(br)
+
+        def _nil_border(tag: str):
+            el = OxmlElement(tag)
+            el.set(qn("w:val"), "nil")
+            el.set(qn("w:sz"), "0")
+            el.set(qn("w:space"), "0")
+            el.set(qn("w:color"), "auto")
+            return el
+
+        tbl = OxmlElement("w:tbl")
+        tblPr = OxmlElement("w:tblPr")
+        tblW = OxmlElement("w:tblW")
+        tblW.set(qn("w:w"), "0")
+        tblW.set(qn("w:type"), "auto")
+        tblPr.append(tblW)
+        borders = OxmlElement("w:tblBorders")
+        for edge in ("top", "left", "bottom", "right", "insideH", "insideV"):
+            borders.append(_nil_border(f"w:{edge}"))
+        tblPr.append(borders)
+        mar = OxmlElement("w:tblCellMar")
+        for side in ("top", "left", "bottom", "right"):
+            el = OxmlElement(f"w:{side}")
+            el.set(qn("w:w"), "0")
+            el.set(qn("w:type"), "dxa")
+            mar.append(el)
+        tblPr.append(mar)
+        tbl.append(tblPr)
+        grid = OxmlElement("w:tblGrid")
+        grid_col = OxmlElement("w:gridCol")
+        grid_col.set(qn("w:w"), "9360")
+        grid.append(grid_col)
+        tbl.append(grid)
+        tr = OxmlElement("w:tr")
+        trPr = OxmlElement("w:trPr")
+        trPr.append(OxmlElement("w:cantSplit"))
+        tr.append(trPr)
+        tc = OxmlElement("w:tc")
+        tcPr = OxmlElement("w:tcPr")
+        tcW = OxmlElement("w:tcW")
+        tcW.set(qn("w:w"), "9360")
+        tcW.set(qn("w:type"), "dxa")
+        tcPr.append(tcW)
+        tc.append(tcPr)
+
+        heading_el.addprevious(tbl)
+        tc.append(heading_el)
+        tc.append(first_img)
+        tr.append(tc)
+        tbl.append(tr)
+        logger.info("Wrapped PROPERTY COMPARABLES with the first comps sheet")
 
     def _keep_heading_with_next(self, doc: Document, heading: str) -> None:
         """Keep `heading` with the following body on one page, starting a new page.
